@@ -48,6 +48,9 @@ adopted-due|s/next unless !defined $lr || $lr + $ev <= $now;/next unless !define
 runner-no-quotes|s#my $cline = local_to_win($wrap);#my $cline = qq{"$j->{command}" } . ($j->{arguments} // '') . qq{ > "} . local_to_win($log) . qq{" 2>\&1};#
 loud-after-three|s/next unless $f >= 3;/next unless $f >= 99;/
 between-passes|s/if ($sec % 5 == 0) {/if (0) {/
+path-sep|s/my $sep = is_win() ? ';' : ':';/my $sep = ':';/
+localize|s#$p = uc($1) . ':' . ($2 // '/')#1#
+doctor-reason|s/'NOT found: ' . sched_reason() . '.'/'NOT found.'/
 EOF
   if HEALER="$HEALER" sh "$0" > "$W/out" 2>&1; then ctl=passed; else ctl=FAILED; cat "$W/out"; fi
   if [ "$c" -eq "$n" ] && [ "$ctl" = passed ]; then echo "PROVE-RED OK ($c of $n caught; control passed)"; exit 0; fi
@@ -366,6 +369,34 @@ i=0; while [ ! -e "$ST/watch.pid" ] && [ $i -lt 50 ]; do i=$((i + 1)); sleep 0.2
 kill -INT "$WPID"; i=0; while kill -0 "$WPID" 2>/dev/null && [ $i -lt 50 ]; do i=$((i + 1)); sleep 0.2; done
 ! kill -0 "$WPID" 2>/dev/null && [ ! -e "$ST/watch.lock" ] && grep -q 'watch stopped after' "$W/wb" && ok "INT stops watch cleanly" || no "INT" "$(cat "$W/wb")"
 WPID=
+
+# ---- a native Windows perl ($^O MSWin32): ';' PATH, /x/ paths read as X:/, no df --------------------------
+PA=$(command -v "$PERL"); PYA=$(command -v "$PY"); ENVA=$(command -v env)
+mkdir -p "$W/emptybin" "$W/winbin" "$W/gdrive/.crude-ci.lock" "$W/gdrive/log" "$W/jw/crude-ci"
+printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$PYA" "$TD/fake-schtasks.py" > "$W/winbin/schtasks"; chmod +x "$W/winbin/schtasks"
+printf '#!/bin/sh\nprintf "F 204073646080 38604800000\\nE 0 0\\n"\n' > "$W/winbin/powershell"; chmod +x "$W/winbin/powershell"
+echo '77 UCRT64 2026-11-06T12:00:00 emacs-ucrt-32' > "$W/gdrive/.crude-ci.lock/who"; touch "$W/gdrive/log/emacs-ucrt-32-abc123-2026-11-06-1200.log"
+echo loop > "$W/jw/crude-ci/source"; echo /g/.crude-ci.lock > "$W/jw/crude-ci/lock"; echo '/g/log/*.log' > "$W/jw/crude-ci/log_glob"
+WIN() { env AVALON_HEALER_OS=MSWin32 AVALON_HEALER_DRIVEMAP="G=$W/gdrive" AVALON_HEALER_JOBS="$W/jw" AVALON_HEALER_SCHTASKS=schtasks "$@"; }
+out=$(WIN PATH="$W/emptybin;$W/winbin" "$PA" "$HEALER" jobs)
+has "under MSWin32, /g/.crude-ci.lock is read as G:/ and found" "$out" "crude-ci: running now (77 UCRT64 2026-11-06T12:00:00 emacs-ucrt-32)"
+hasnt "under MSWin32, schtasks is found on a ';' PATH" "$out" "Task Scheduler is not reachable"
+out=$(WIN PATH="$W/emptybin;$W/winbin" "$ENVA" -u AVALON_HEALER_DF "$PA" "$HEALER" look --raw --no-measure)
+has "with no df, drives come from PowerShell (ceil like df: 85%)" "$out" "F${TAB}85${TAB}tight"
+hasnt "a PowerShell drive with no size is left out" "$out" "E${TAB}"
+out=$(WIN PATH="$W/emptybin" "$ENVA" -u AVALON_HEALER_DF -u SystemRoot "$PA" "$HEALER" look --no-measure)
+has "with neither df nor PowerShell, drives are said not measured, with why" "$out" "df gave no drives. (not measured: this perl (MSWin32) found neither df nor PowerShell.)"
+out=$(WIN PATH="$W/emptybin" "$ENVA" -u SystemRoot "$PA" "$HEALER" jobs)
+has "jobs says why Task Scheduler is not reachable" "$out" "(Task Scheduler is not reachable: this perl ($PA, MSWin32) found no schtasks on PATH (searched 1 folders, split on ';') and none at %SystemRoot%\\System32\\schtasks.exe; so Windows tasks were not checked.)"
+out=$(WIN PATH="$W/emptybin" "$ENVA" -u AVALON_HEALER_DF -u SystemRoot "$PA" "$HEALER" doctor)
+has "doctor names the perl" "$out" "Perl: $PA, \$^O MSWin32. A native Windows perl"
+has "doctor says how /g/log is read and that it is found" "$out" "/g/log (read as $W/gdrive/log): found."
+has "doctor says schtasks is missing and why" "$out" "schtasks (Task Scheduler): NOT found: this perl ($PA, MSWin32) found no schtasks on PATH (searched 1 folders, split on ';')"
+has "doctor says du is missing and what that means" "$out" "du: not found on PATH. Seat sizes will not be measured."
+has "doctor counts the job's logs where it reads them" "$out" "Job crude-ci: logs /g/log/*.log (read as $W/gdrive/log/*.log): 1 found."
+out=$(WIN PATH="$W/emptybin;$W/winbin" "$PA" "$HEALER" doctor)
+has "doctor says where it found schtasks" "$out" "schtasks (Task Scheduler): found at $W/winbin/schtasks."
+rm -rf "$W/jw" "$W/gdrive"
 
 # ---- it never moves or deletes outside what was queued ---------------------------------------------------------
 rm -rf "$S/bulk" "$W/f/claude/bulk" "$W/h/bulk3" "$W/h/bulk2"

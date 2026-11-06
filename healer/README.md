@@ -15,6 +15,14 @@ looks at the drives, writes down what changed, reports jobs, runs adopted jobs t
 and runs queued moves that are due. Only one watch runs at a time. `perl avalon-healer status`
 says whether one is running.
 
+## If something looks missing
+
+    perl avalon-healer doctor          # which perl, whether /g resolves, schtasks, df, du, drives
+
+Either perl works: the MSYS one (/usr/bin/perl) or a native Windows one (/ucrt64/bin/perl,
+Strawberry). Under a native one, paths like /g/log are read as G:/log, and drives come from
+PowerShell when there is no df. To see which you have: perl -e 'print "$^X $^O\n"'
+
 ## Look and ask
 
     perl avalon-healer look            # drives: size, used, free, %; the seats on each

@@ -38,7 +38,8 @@ use File::Basename qw(dirname basename);
 use File::Path qw(make_path);
 use File::Glob qw(bsd_glob);
 use Cwd qw(abs_path);
-use Encode qw(decode);
+use Encode qw(decode encode);
+use MIME::Base64 qw(encode_base64);
 
 $ENV{LC_ALL} = 'C';
 my $HERE = dirname(abs_path($0));
@@ -73,6 +74,7 @@ my %HELP = (
   move => "move --seat NAME --to PATH (--at YYYY-MM-DDTHH:MM | --when-tight) [--remove-source] [--margin-mb N]\n  Queue a move.  move --run ID [--remove-source] runs one now.  move --rollback ID removes a copy that did not finish.",
   moves => "moves                                    the queue, in words\n  moves --cancel ID                        drop a queued move that has not started",
   unmove => "unmove ID\n  Reverse a finished move: copy back, verify, then remove the moved copy; the seat path is restored.",
+  doctor => "doctor\n  What this perl can and cannot see: which perl, whether /g resolves, schtasks, df, du, the drives.",
   watch => "watch [--every 17m] [--once] [--passes N]\n  Runs until stopped (Ctrl-C, or `stop` from another shell).  Each pass: look, log, jobs, adopted\n  jobs that are due, moves that are due.  Writes state/heartbeat and state/watch.pid; one watcher at a time.",
   stop => "stop\n  Ask a running watch to stop after its current step.",
   status => "status\n  Is watch running?  Its pid and last heartbeat.",
@@ -86,7 +88,29 @@ sub line1 { my $f = shift; open(my $h, '<', $f) or return undef; my $l = <$h>; c
   return undef unless defined $l; $l =~ s/[\r\n]+$//; return $l }
 sub put { my ($f, $v) = @_; make_path(dirname($f)); open(my $h, '>', $f) or die2("cannot write $f: $!"); print $h "$v\n"; close $h }
 sub lines_of { my $f = shift; open(my $h, '<', $f) or return (); my @l = map { s/[\r\n]+$//r } <$h>; close $h; @l }
-sub have { my $c = shift; return -x $c if $c =~ m{/}; for (split /:/, $ENV{PATH} // '') { return 1 if -x "$_/$c" || -x "$_/$c.exe" } 0 }
+# ---- which perl: MSYS perl (/usr/bin/perl, $^O msys) reads /f/... paths; a native Windows perl
+# (/ucrt64/bin/perl or Strawberry, $^O MSWin32) does not, and its PATH is ';'-separated.
+sub os_name { $ENV{AVALON_HEALER_OS} // $^O }          # AVALON_HEALER_OS: tests only
+sub is_win { os_name() eq 'MSWin32' }
+sub on_windows { my $o = os_name(); $o eq 'MSWin32' || $o eq 'msys' || $o eq 'cygwin' }
+# every filesystem touch goes through localize(): under a native Windows perl /x/rest becomes X:/rest
+sub localize { my $p = shift; return $p unless defined $p && is_win();
+  if ($p =~ m{^/([A-Za-z])(/.*)?$}) { $p = uc($1) . ':' . ($2 // '/') }  # PR:localize
+  if (defined $ENV{AVALON_HEALER_DRIVEMAP} && $p =~ /^([A-Za-z]):(.*)$/) { my ($d, $r) = (uc $1, $2);   # tests only: X=DIR;Y=DIR
+    for (split /;/, $ENV{AVALON_HEALER_DRIVEMAP}) { my ($k, $v) = split /=/, $_, 2; return $v . $r if defined $v && uc $k eq $d } }
+  $p }
+sub path_dirs { my $sep = is_win() ? ';' : ':';  # PR:path-sep
+  grep { length } split /\Q$sep\E/, ($ENV{PATH} // '') }
+# have(NAME): the full path of a program, or undef.  Under Windows also NAME.exe, .cmd, .bat.
+sub have { my $c = shift; return undef unless defined $c && length $c;
+  if ($c =~ m{[/\\]}) { my $l = localize($c); return (-f $l && (is_win() || -x $l)) ? $l : undef }
+  my @ext = ('', (on_windows() ? ('.exe', '.cmd', '.bat') : ()));
+  for my $d (path_dirs()) { for my $e (@ext) { my $f = "$d/$c$e"; return $f if -f $f && (is_win() || -x $f) } }
+  undef }
+sub find_schtasks { my $f = have($O{schtasks}); return $f if $f;
+  if (is_win() && $ENV{SystemRoot}) { my $s = "$ENV{SystemRoot}\\System32\\schtasks.exe"; return $s if -f $s }
+  undef }
+sub sched_reason { 'this perl (' . $^X . ', ' . os_name() . ") found no $O{schtasks} on PATH (searched " . scalar(path_dirs()) . " folders, split on '" . (is_win() ? ';' : ':') . "')" . (is_win() ? ' and none at %SystemRoot%\\System32\\schtasks.exe' : '') }
 sub dirs_in { my $d = shift; opendir(my $h, $d) or return (); my @n = sort grep { !/^\./ && -d "$d/$_" } readdir $h; closedir $h; @n }
 sub label { my $d = shift; length($d) == 1 ? "$d:" : $d }
 
@@ -113,8 +137,8 @@ sub jdn { my ($y, $m, $d) = @_; my $a = int((14 - $m) / 12); my $yy = $y + 4800 
 
 sub mapped { my $p = shift; return $p unless defined $p;
   for my $pair (@{ $O{map} }) { my ($from, $to) = split /=/, $pair, 2; next unless defined $to;
-    return $to . substr($p, length $from) if $p eq $from || index($p, "$from/") == 0 }
-  $p }
+    return localize($to . substr($p, length $from)) if $p eq $from || index($p, "$from/") == 0 }
+  localize($p) }
 sub drive_of_path { my $p = shift // return ''; return uc $1 if $p =~ m{^/([A-Za-z])(?:/|$)} || $p =~ /^([A-Za-z]):/; '' }
 
 # ---- facts: one file per fact; refuse placeholders --------------------------------------------
@@ -139,8 +163,21 @@ sub read_seats {
   }
   @s }
 
+my $DF_WHY = '';
+sub df_lines { $DF_WHY = '';
+  if (defined $O{df}) { -r $O{df} or die2("cannot read $O{df}"); $DF_WHY = "from the file $O{df}"; return lines_of($O{df}) }
+  if (my $df = have('df')) { $DF_WHY = "from $df -P"; open(my $h, '-|', $df, '-P') or return (); my @l = map { s/[\r\n]+$//r } <$h>; close $h; return @l }
+  if (is_win() and my $ps = have('powershell')) {
+    my $script = 'Get-PSDrive -PSProvider FileSystem | ForEach-Object { "$($_.Name) $($_.Used) $($_.Free)" }';
+    open(my $h, '-|', $ps, '-NoProfile', '-NonInteractive', '-EncodedCommand', encode_base64(encode('UTF-16LE', $script), '')) or return ();
+    my @l = ('Filesystem 1024-blocks Used Available Capacity Mounted on');
+    while (<$h>) { s/[\r\n]+$//; my ($n, $u, $f) = split ' '; next unless defined $f && $n =~ /^[A-Za-z]$/ && $u =~ /^\d+$/ && $f =~ /^\d+$/ && $u + $f > 0;
+      my $t = $u + $f; my $pct = int(($u * 100 + $t - 1) / $t);
+      push @l, join(' ', uc($n) . ':', int($t / 1024), int($u / 1024), int($f / 1024), "$pct%", uc($n) . ':') }
+    close $h; $DF_WHY = "from PowerShell Get-PSDrive ($ps)"; return @l }
+  $DF_WHY = 'not measured: this perl (' . os_name() . ') found neither df nor PowerShell'; return () }
 sub read_df {
-  my @l = defined $O{df} ? do { -r $O{df} or die2("cannot read $O{df}"); lines_of($O{df}) } : map { s/[\r\n]+$//r } `df -P 2>/dev/null`;
+  my @l = df_lines();
   my (@d, %seen);
   for my $i (1 .. $#l) {
     my @f = split ' ', $l[$i]; next if @f < 6;
@@ -157,9 +194,10 @@ sub measure {
   return { st => 'nopath' } unless length $s->{mp};
   if ($O{'no-measure'}) { return defined $ckb ? { kb => $ckb, st => 'cached', date => $cdate } : { st => 'none' } }
   return { st => 'missing' } unless -d $s->{mp};
-  return { st => 'nocap' } unless have('timeout');
+  my @du = split ' ', $O{du}; my $tm = have('timeout'); my $dp = have($du[0]);
+  return { st => 'nocap' } unless $tm && $dp;
   my $out = '';
-  if (open(my $h, '-|', 'timeout', $O{cap}, split(' ', $O{du}), '-sk', $s->{mp})) { local $/; $out = <$h> // ''; close $h }
+  if (open(my $h, '-|', $tm, $O{cap}, $dp, @du[1 .. $#du], '-sk', $s->{mp})) { local $/; $out = <$h> // ''; close $h }
   my $rc = $? >> 8;
   if ($rc == 0 && $out =~ /^(\d+)/) { put("$c/kb", $1); put("$c/date", today()); return { kb => $1, st => 'measured', date => today() } }
   return { kb => $ckb, st => 'timeout', date => $cdate };  # PR:timeout-keeps-cache-apart
@@ -175,7 +213,7 @@ sub sizeword { my $s = shift; my $z = $s->{size}; my $st = $z->{st};
   return human($z->{kb}) . ' (measured now)' if $st eq 'measured';
   return human($z->{kb}) . " (as last measured on $z->{date})" if $st eq 'cached';
   return "not measured in $O{cap} s" . (defined $z->{kb} ? "; last measured " . human($z->{kb}) . " on $z->{date}" : '; size not known yet') if $st eq 'timeout';
-  return 'not measured (this shell has no timeout command to cap it)' if $st eq 'nocap';
+  return 'not measured (this perl found no timeout or du program to measure it with)' if $st eq 'nocap';
   return "not found at $s->{mp}" if $st eq 'missing';
   return 'no path declared' if $st eq 'nopath';
   'never measured' }
@@ -202,7 +240,7 @@ sub cmd_look {
   my @blind = grep { !$pc{$_->{drive}} } @s;
   if (@blind) { say ''; say 'Seats on drives this shell cannot see:';
     say seatline($_, \@s), (length $_->{drive} ? ' (declared on ' . label($_->{drive}) . ')' : ' (no drive declared)') for @blind }
-  if (!@d) { say ''; say 'df gave no drives.' }
+  if (!@d) { say ''; say 'df gave no drives.' . ($DF_WHY =~ /^not measured/ ? " ($DF_WHY.)" : '') }
   paused_line(); failing_lines() unless $IN_WATCH;
 }
 
@@ -335,9 +373,9 @@ sub parse_csv_line { my $l = shift; my @f; while (length $l) {
     elsif ($l =~ s/^([^,]*)(?:,|$)//) { push @f, $1 } else { last } } @f }
 
 sub run_schtasks { my @args = @_;   # returns (exit, output bytes)
-  return (127, '') unless have($O{schtasks});
+  my $st = find_schtasks() // return (127, '');
   local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-  open(my $h, '-|', $O{schtasks}, @args) or return (127, '');
+  open(my $h, '-|', $st, @args) or return (127, '');
   binmode $h; local $/; my $out = <$h> // ''; close $h; return ($? >> 8, $out) }
 
 sub read_tasks {
@@ -425,7 +463,7 @@ sub mine_rule { my %a = @_; my $n = safe_name($a{'mine-rule'}); my $m = $a{match
   put("$O{rules}/$n", "$k $v"); say "rule $n: $k $v." }
 
 sub scan { my %a = @_;
-  my $T = read_tasks(); unless ($T) { say 'Task Scheduler is not reachable from this shell (no schtasks command).'; return }
+  my $T = read_tasks(); unless ($T) { say 'Task Scheduler is not reachable: ' . sched_reason() . '.'; return }
   my @rules = read_rules(); my (@ours, @not); my $ms = 0;
   for my $n (@{ $T->{order} }) { my ($ok, $why) = classify($T->{tasks}{$n}, \@rules);
     if ($ok) { push @ours, [$n, $why] } elsif (!$a{all} && $n =~ /^\\Microsoft\\/) { $ms++ } else { push @not, [$n, $why] } }
@@ -439,7 +477,7 @@ sub iso_minutes { my $d = shift // return undef; $d =~ /^P(?:(\d+)D)?(?:T(?:(\d+
 sub xml_text { my $x = shift; return undef unless defined $x; $x =~ s/&quot;/"/g; $x =~ s/&apos;/'/g; $x =~ s/&lt;/</g; $x =~ s/&gt;/>/g; $x =~ s/&amp;/&/g; $x }
 
 sub adopt { my $name = task_key(shift);
-  my $T = read_tasks() // refuse('Task Scheduler is not reachable from this shell (no schtasks command).');
+  my $T = read_tasks() // refuse('Task Scheduler is not reachable: ' . sched_reason() . '.');
   my $t = $T->{tasks}{$name} // refuse("no Windows task named $name.");
   my ($ours, $why) = classify($t, [read_rules()]);
   refuse("$name is not ours ($why); the healer never touches it.") unless $ours;  # PR:adopt-only-ours
@@ -522,7 +560,7 @@ sub jobs_report {
     push @w, 'ok' unless @w;
     say "$t: ", join('; ', @w), (defined $lr ? '; last run ' . stamp($lr) : ''), '.';
   }
-  say '(Task Scheduler is not reachable from this shell, so Windows tasks were not checked.)' unless $T;
+  say '(Task Scheduler is not reachable: ' . sched_reason() . '; so Windows tasks were not checked.)' unless $T;
   if ($T) { my $sd = "$O{state}/seen-jobs"; my @new;
     for my $n (@{ $T->{order} }) { next if $declared{$n} || $n =~ /^\\Microsoft\\/; my $s = job_slug($n); next if -e "$sd/$s";
       my ($ok, $why) = classify($T->{tasks}{$n}, \@rules); push @new, "  $n (" . ($ok ? 'ours' : 'not ours') . ": $why)"; put("$sd/$s", $n) }
@@ -530,7 +568,7 @@ sub jobs_report {
   paused_line(); failing_lines() unless $IN_WATCH;
 }
 
-sub windows_runner { return $ENV{AVALON_HEALER_CMD} if $ENV{AVALON_HEALER_CMD}; return 'cmd.exe' if $^O eq 'msys' || $^O eq 'MSWin32' || $^O eq 'cygwin'; undef }
+sub windows_runner { return $ENV{AVALON_HEALER_CMD} if $ENV{AVALON_HEALER_CMD}; return 'cmd.exe' if on_windows(); undef }
 
 # An adopted job runs through a small wrapper, state/jobs/NAME/run.cmd, so cmd.exe is handed one
 # plain path and no quoted string: cmd /c strips the first and last quote of a line that holds
@@ -579,7 +617,7 @@ sub failing_lines { my $printed = 0;
   $printed }
 
 sub win_to_local { my $p = shift; return $p unless $p =~ /^([A-Za-z]):[\\\/]?(.*)$/; (my $r = $2) =~ s{\\}{/}g; mapped('/' . lc($1) . '/' . $r) }
-sub local_to_win { my $p = shift; return $p unless $p =~ m{^/([a-z])/(.*)$}; (my $r = $2) =~ s{/}{\\}g; uc($1) . ":\\$r" }
+sub local_to_win { my $p = shift; return $p unless $p =~ m{^/([A-Za-z])/(.*)$} || $p =~ m{^([A-Za-z]):[/\\](.*)$}; (my $r = $2) =~ s{/}{\\}g; uc($1) . ":\\$r" }
 
 # ================================================================================ moves
 sub mdir { "$O{moves}/$_[0]" }
@@ -628,7 +666,8 @@ sub dest_avail_kb { my $to = shift; my $dr = drive_of_path($to);
   for my $d (read_df()) { return $d->{avail} if length $dr && $d->{d} eq $dr }
   return undef if defined $O{df};
   my $p = mapped($to); $p = dirname($p) until -e $p || $p eq '/' || $p eq '.';
-  my @l = `df -P "$p" 2>/dev/null`; my @f = split ' ', ($l[1] // ''); return @f >= 6 ? $f[-3] : undef }
+  my $df = have('df') // return undef; open(my $h, '-|', $df, '-P', $p) or return undef; my @l = <$h>; close $h;
+  my @f = split ' ', ($l[1] // ''); return @f >= 6 ? $f[-3] : undef }
 
 sub run_move { my ($id, $rs_flag) = @_; my $m = mget($id) // refuse("no move $id.");
   refuse("move $id is $m->{state}.") if $m->{state} =~ /^(?:done|unmoved)$/;
@@ -654,7 +693,7 @@ sub run_move { my ($id, $rs_flag) = @_; my $m = mget($id) // refuse("no move $id
   make_path($dst, map { "$dst/$_" } @$dirs);
   for (@$files) { my $t = "$dst/$_"; next if -f $t && -s $t == -s "$src/$_" && sha($t) eq $h{$_};
     copy("$src/$_", "$t.healer-part") or return rollback($id, $files, "copy of $_ failed: $!");
-    my @st = stat("$src/$_"); utime $st[8], $st[9], "$t.healer-part"; rename "$t.healer-part", $t or return rollback($id, $files, "rename of $_ failed: $!") }
+    my @st = stat("$src/$_"); utime $st[8], $st[9], "$t.healer-part"; unlink $t; rename "$t.healer-part", $t or return rollback($id, $files, "rename of $_ failed: $!") }
   system('sh', '-c', $ENV{AVALON_HEALER_HOOK_AFTER_COPY}) if $ENV{AVALON_HEALER_HOOK_AFTER_COPY};   # tests only: harm the copy on purpose
   ;  # PR:early-remove
   # 3. verify every file on both sides against the manifest
@@ -741,12 +780,37 @@ sub cmd_watch { my %a = @_;
 
 sub cmd_stop { my $pid = line1("$O{state}/watch.pid");
   unless (-d "$O{state}/watch.lock") { say 'watch is not running.'; return }
-  put("$O{state}/watch.stop", stamp()); kill('TERM', $pid) if $pid && $pid =~ /^\d+$/;
+  put("$O{state}/watch.stop", stamp());
+  kill('TERM', $pid) if $pid && $pid =~ /^\d+$/ && !is_win();   # a native Windows kill would end it without cleaning up; the stop file is enough
   for (1 .. 15) { last unless -d "$O{state}/watch.lock"; sleep 1 }
   say -d "$O{state}/watch.lock" ? 'Asked watch to stop; it will stop after its current step.' : 'watch stopped.' }
 
 sub cmd_status { say watch_live() ? 'watch is running (pid ' . (line1("$O{state}/watch.pid") // '?') . '); last heartbeat: ' . (line1("$O{state}/heartbeat") // 'none') . '.'
                                   : 'watch is not running' . (defined line1("$O{state}/heartbeat") ? '; last heartbeat: ' . line1("$O{state}/heartbeat") : '') . '.' }
+
+# ================================================================================ doctor
+sub cmd_doctor {
+  my $w = is_win();
+  say 'avalon-healer doctor, ', stamp(), ':';
+  say "  Perl: $^X, \$^O " . os_name() . '. ' . ($w ? 'A native Windows perl: paths like /g/log are read as G:/log, and PATH is split on ;.'
+      : os_name() eq 'msys' ? 'The MSYS perl: paths like /g/log are read as they are, and PATH is split on :.' : 'Not a Windows perl: paths are read as they are.');
+  say "  The healer lives at $HERE.";
+  for my $p ('/f/claude', '/g', '/g/log', '/h', '/i') { my $l = localize($p); say "  $p" . ($l ne $p ? " (read as $l)" : '') . ': ' . (-d $l ? 'found' : 'NOT found') . '.' }
+  my $st = find_schtasks();
+  say '  schtasks (Task Scheduler): ' . ($st ? "found at $st." : 'NOT found: ' . sched_reason() . '.');  # PR:doctor-reason
+  for my $c (qw(df du timeout cmd powershell)) { my $f = have($c);
+    say "  $c: " . ($f ? "found at $f." : 'not found on PATH.') .
+      ($c eq 'df' && !$f ? ($w ? ' Drives will come from PowerShell if it is found.' : ' Drives will not be measured.') : '') .
+      ($c eq 'du' && !$f ? ' Seat sizes will not be measured.' : '') . ($c eq 'timeout' && !$f ? ' Seat sizes will not be measured (no time cap).' : '') }
+  my @d = read_df();
+  if (@d) { say "  Drives seen ($DF_WHY):"; printf "    %s %s%% used, %s free.\n", label($_->{d}), $_->{pct}, human($_->{avail}) for @d }
+  else { say "  Drives seen: none ($DF_WHY)." }
+  for my $s (read_seats()) { next unless length $s->{path}; say "  Seat $s->{name}: $s->{path}" . ($s->{mp} ne $s->{path} ? " (read as $s->{mp})" : '') . ': ' . (-d $s->{mp} ? 'found' : 'NOT found') . '.' }
+  for my $j (read_jobs()) {
+    say "  Job $j->{name}: lock $j->{lock} " . (-e mapped($j->{lock}) ? 'present' : 'absent') . " (read as " . mapped($j->{lock}) . ').' if defined $j->{lock};
+    if (defined $j->{log_glob}) { my @g = bsd_glob(mapped($j->{log_glob})); say "  Job $j->{name}: logs $j->{log_glob} (read as " . mapped($j->{log_glob}) . '): ' . scalar(@g) . ' found.' } }
+  say '  watch: ' . (watch_live() ? 'running (pid ' . (line1("$O{state}/watch.pid") // '?') . ').' : 'not running.');
+}
 
 # ================================================================================ main
 my @COMMON = ('seats=s', 'state=s', 'jobs=s', 'moves=s', 'rules=s', 'df=s', 'du=s', 'map=s@', 'now=s', 'today=s', 'tight=i', 'cap=i', 'shown=i', 'schtasks=s', 'no-measure', 'raw', 'help');
@@ -755,13 +819,13 @@ my %SPEC = (
   seats => ['set=s', 'path=s', 'drive=s', 'role=s', 'home=s', 'home-path=s', 'ignored=s', 'note=s', 'fact=s@', 'unset=s@'],
   jobs => ['set=s', 'task=s', 'source=s', 'every=s', 'log-glob=s', 'lock=s', 'ok-marker=s', 'note=s', 'unset=s@', 'scan', 'all', 'mine-rule=s', 'match=s', 'adopt=s', 'release=s'],
   move => ['seat=s', 'to=s', 'at=s', 'when-tight', 'remove-source', 'margin-mb=i', 'run=s', 'rollback=s'],
-  moves => ['cancel=s'], unmove => [], watch => ['every=s', 'once', 'passes=i'], stop => [], status => [],
+  moves => ['cancel=s'], unmove => [], watch => ['every=s', 'once', 'passes=i'], stop => [], status => [], doctor => [],
 );
 my $cmd = shift(@ARGV) // 'help';
 if ($cmd =~ /^(?:help|-h|--help)$/ || !$SPEC{$cmd}) {
   print STDERR "avalon-healer: unknown command '$cmd'\n" unless $cmd =~ /^(?:help|-h|--help)$/;
   print "usage: avalon-healer COMMAND [options]   (avalon-healer COMMAND --help for one)\n";
-  print "  $HELP{$_}\n" for qw(look advise log seats jobs move moves unmove watch stop status);
+  print "  $HELP{$_}\n" for qw(look advise log seats jobs move moves unmove watch stop status doctor);
   print "common options: --tight N (85)  --cap S (20)  --no-measure  --seats/--state/--jobs/--moves/--rules DIR  --df FILE  --map FROM=TO  --now YYYY-MM-DDTHH:MM\n";
   exit($cmd =~ /^(?:help|-h|--help)$/ ? 0 : 2);
 }
@@ -770,7 +834,8 @@ GetOptionsFromArray(\@ARGV, \%a, @COMMON, @{ $SPEC{$cmd} }) or do { print STDERR
 if ($a{help}) { print "usage: avalon-healer $HELP{$cmd}\n"; exit 0 }
 for (qw(seats state jobs moves rules df du now today tight cap shown schtasks raw no-measure)) { $O{$_} = $a{$_} if defined $a{$_} }
 push @{ $O{map} }, @{ $a{map} } if $a{map};
+$O{$_} = localize($O{$_}) for grep { defined $O{$_} } qw(seats state jobs moves rules df);
 my $rc = $cmd eq 'look' ? cmd_look(%a) : $cmd eq 'advise' ? cmd_advise() : $cmd eq 'log' ? cmd_log() : $cmd eq 'seats' ? cmd_seats(%a)
        : $cmd eq 'jobs' ? cmd_jobs(%a) : $cmd eq 'move' ? cmd_move(%a) : $cmd eq 'moves' ? cmd_moves(%a) : $cmd eq 'unmove' ? cmd_unmove($ARGV[0])
-       : $cmd eq 'watch' ? cmd_watch(%a) : $cmd eq 'stop' ? cmd_stop() : cmd_status();
+       : $cmd eq 'watch' ? cmd_watch(%a) : $cmd eq 'stop' ? cmd_stop() : $cmd eq 'doctor' ? cmd_doctor() : cmd_status();
 exit(($cmd eq 'move' && defined $a{run} && $rc) ? 1 : 0);
