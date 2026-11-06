@@ -52,6 +52,20 @@ path-sep|s/my $sep = is_win() ? ';' : ':';/my $sep = ':';/
 localize|s#$p = uc($1) . ':' . ($2 // '/')#1#
 doctor-reason|s/'NOT found: ' . sched_reason() . '.'/'NOT found.'/
 EOF
+  # path-captures: the old local_to_win and win_to_local (before 721c476), which read $1 after an s///
+  # had cleared it.  They are whole lines, so this fault is planted by awk, not by a PR: tag.
+  n=$((n + 1))
+  cat > "$W/old-w2l" <<'EOF'
+sub win_to_local { my $p = shift; return $p unless $p =~ /^([A-Za-z]):[\\\/]?(.*)$/; (my $r = $2) =~ s{\\}{/}g; mapped('/' . lc($1) . '/' . $r) }
+EOF
+  cat > "$W/old-l2w" <<'EOF'
+sub local_to_win { my $p = shift; return $p unless $p =~ m{^/([A-Za-z])/(.*)$} || $p =~ m{^([A-Za-z]):[/\\](.*)$}; (my $r = $2) =~ s{/}{\\}g; uc($1) . ":\\$r" }
+EOF
+  awk -v A="$W/old-w2l" -v B="$W/old-l2w" '/^sub win_to_local /{ while ((getline l < A) > 0) print l; next }
+    /^sub local_to_win /{ while ((getline l < B) > 0) print l; next } { print }' "$HEALER" > "$W/mutant"
+  if cmp -s "$HEALER" "$W/mutant"; then echo "fault path-captures: NOT PLANTED (no sub line matched)"
+  elif HEALER="$W/mutant" timeout 300 sh "$0" > "$W/out" 2>&1; then echo "fault path-captures: MISSED (checks stayed green)"
+  else c=$((c + 1)); echo "fault path-captures: caught ($(grep -c '^not ok' "$W/out") check(s) red)"; fi
   if HEALER="$HEALER" sh "$0" > "$W/out" 2>&1; then ctl=passed; else ctl=FAILED; cat "$W/out"; fi
   if [ "$c" -eq "$n" ] && [ "$ctl" = passed ]; then echo "PROVE-RED OK ($c of $n caught; control passed)"; exit 0; fi
   echo "PROVE-RED FAILED ($c of $n caught; control $ctl)"; exit 1
@@ -397,6 +411,35 @@ has "doctor counts the job's logs where it reads them" "$out" "Job crude-ci: log
 out=$(WIN PATH="$W/emptybin;$W/winbin" "$PA" "$HEALER" doctor)
 has "doctor says where it found schtasks" "$out" "schtasks (Task Scheduler): found at $W/winbin/schtasks."
 rm -rf "$W/jw" "$W/gdrive"
+
+# ---- path conversions are clean under perl -w (Corwin's watch window, 2026-11-06: "Use of uninitialized
+# value $1 in uc at avalon-healer line 620" on every run; fixed in 721c476).  local_to_win and win_to_local
+# are lifted out of the healer as they stand, with mapped() as the identity, and run on paths holding
+# slashes and backslashes: a wrong answer, or any warning at all, is red.
+{ echo 'use strict; use warnings; sub mapped { $_[0] }'
+  grep -E '^sub (win_to_local|local_to_win) ' "$HEALER"
+  cat <<'EOF'
+my @cases = (
+  ['l2w', '/f/claude/projects/avalon/healer/state/jobs/wheel-tail-relay/run-20261106-124204.log',
+          'F:\claude\projects\avalon\healer\state\jobs\wheel-tail-relay\run-20261106-124204.log'],
+  ['l2w', '/g/log/x.log', 'G:\log\x.log'],
+  ['l2w', 'F:/claude/bin/wheel-relay.cmd', 'F:\claude\bin\wheel-relay.cmd'],
+  ['l2w', 'F:\claude\bin\wheel-relay.cmd', 'F:\claude\bin\wheel-relay.cmd'],
+  ['l2w', 'F:\claude/mixed\path/x', 'F:\claude\mixed\path\x'],
+  ['l2w', 'relative/path', 'relative/path'],
+  ['w2l', 'F:\claude\bin\wheel-relay.cmd', '/f/claude/bin/wheel-relay.cmd'],
+  ['w2l', 'G:/log/x.log', '/g/log/x.log'],
+  ['w2l', 'H:\pub/mixed\x', '/h/pub/mixed/x'],
+  ['w2l', '/already/local', '/already/local'],
+);
+for my $c (@cases) { my ($f, $in, $want) = @$c; my $got = $f eq 'l2w' ? local_to_win($in) : win_to_local($in);
+  print(($got eq $want ? 'same' : 'DIFFERENT') . " $f $in => $got\n") }
+EOF
+} > "$W/paths.pl"
+"$PERL" -w "$W/paths.pl" > "$W/paths.out" 2> "$W/paths.err"
+[ "$(grep -c -E '^sub (win_to_local|local_to_win) ' "$HEALER")" -eq 2 ] && ok "local_to_win and win_to_local are each one line the check can lift" || no "local_to_win/win_to_local not found as one-line subs; this check cannot lift them"
+[ ! -s "$W/paths.err" ] && ok "path conversions run under perl -w with no warning" || no "path conversions warn under perl -w" "$(cat "$W/paths.err")"
+[ "$(grep -c '^same ' "$W/paths.out")" -eq 10 ] && ok "path conversions give the expected path in all 10 cases (slashes and backslashes)" || no "path conversions gave a wrong path" "$(cat "$W/paths.out")"
 
 # ---- it never moves or deletes outside what was queued ---------------------------------------------------------
 rm -rf "$S/bulk" "$W/f/claude/bulk" "$W/h/bulk3" "$W/h/bulk2"
