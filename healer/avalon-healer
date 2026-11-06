@@ -616,8 +616,8 @@ sub failing_lines { my $printed = 0;
     say "   It is not doing its work. To hand it back to Windows: perl avalon-healer jobs --release '" . task_key($j->{task} // $j->{name}) . "'" }
   $printed }
 
-sub win_to_local { my $p = shift; return $p unless $p =~ /^([A-Za-z]):[\\\/]?(.*)$/; (my $r = $2) =~ s{\\}{/}g; mapped('/' . lc($1) . '/' . $r) }
-sub local_to_win { my $p = shift; return $p unless $p =~ m{^/([A-Za-z])/(.*)$} || $p =~ m{^([A-Za-z]):[/\\](.*)$}; (my $r = $2) =~ s{/}{\\}g; uc($1) . ":\\$r" }
+sub win_to_local { my $p = shift; my ($d, $r) = $p =~ /^([A-Za-z]):[\\\/]?(.*)$/ or return $p; $r =~ s{\\}{/}g; mapped('/' . lc($d) . '/' . $r) }
+sub local_to_win { my $p = shift; my ($d, $r) = $p =~ m{^/([A-Za-z])/(.*)$}; ($d, $r) = $p =~ m{^([A-Za-z]):[/\\](.*)$} unless defined $d; return $p unless defined $d; $r =~ s{/}{\\}g; uc($d) . ":\\$r" }  # captures kept in lexicals: a later s/// clears $1 (Corwin's 12:38 log)
 
 # ================================================================================ moves
 sub mdir { "$O{moves}/$_[0]" }
