@@ -1,0 +1,41 @@
+#!/usr/bin/bash
+# av - one door to the Avalon kit. Fingers do the work; the shapes are the
+# memory aid. Every subcommand is a script that already exists; av never
+# invents behavior, it only routes and remembers where things live.
+#
+#   av lift FILE...        stage an enclave artifact (gates: sig, lint, NO4C)
+#   av drop TOOL...        stage a tool OUTWARD for a friend (see drop.sh)
+#   av pack -o A.tgz       pack the BRING list for a move
+#   av unpack A.tgz        land a pack, manifest-verified
+#   av lint [-s] FILE...   path dialect check
+#   av verify              verify every signed artifact vs keys/
+#   av check               lint + verify (the Makefile's default)
+#   av where               print the kit's paths (for eyes and for scripts)
+#   av help                this
+#
+# Why a dispatcher and not just PATH: a flat PATH gives you the verbs but not
+# the SHAPE. 'av <tab>' recalls the whole kit; the completion below turns the
+# structure into muscle memory, so the hand can move while the head thinks —
+# and when the shape is wrong, you stop, which is the point.
+set -u
+me=$(basename "$0")
+AVALON=${AVALON:-$(cd "$(dirname "$0")/.." && pwd)}
+export AVALON
+
+usage () { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ; exit "${1:-0}" ; }
+need () { test -x "$1" || { echo "$me: missing: $1" ; exit 3 ; } ; }
+
+cmd=${1:-help} ; shift 2>/dev/null || true
+case $cmd in
+  lift)    need "$AVALON/bin/lift.sh"        ; exec "$AVALON/bin/lift.sh" "$@" ;;
+  drop)    need "$AVALON/bin/drop.sh"        ; exec "$AVALON/bin/drop.sh" "$@" ;;
+  pack)    need "$AVALON/utils/movepack.sh"  ; exec "$AVALON/utils/movepack.sh" pack "$@" ;;
+  unpack)  need "$AVALON/utils/movepack.sh"  ; exec "$AVALON/utils/movepack.sh" unpack "$@" ;;
+  lint)    need "$AVALON/tools/path-lint.sh" ; exec "$AVALON/tools/path-lint.sh" "$@" ;;
+  verify)  exec make -C "$AVALON" verify ;;
+  check)   exec make -C "$AVALON" check ;;
+  where)   echo "AVALON=$AVALON" ; for d in bin tools utils keys stage Inbox ; do
+             printf '%-8s %s\n' "$d" "$AVALON/$d" ; done ;;
+  help|-h|--help) usage 0 ;;
+  *)       echo "$me: unknown command: $cmd" ; usage 2 ;;   # loud, never guessed
+esac

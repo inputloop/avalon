@@ -1,0 +1,33 @@
+--- a/bin/lift.sh	(signed 2026-07-07 22:06 CDT, GOOD but contradicts ruled semantics)
++++ b/bin/lift.sh	(NO4C ruled semantics take effect; SEMAPHORES 1.0, ruled 2026-07-08)
+@@ -5,7 +5,8 @@
+ #                 no sig, no lift
+ #   2. dialect  - tools/path-lint.sh -s passes (PATH-DIALECT pin:
+ #                 no lint pass, no MANIFEST)
+-#   3. NO4C     - warn+PARK; semantics provisional; keeper lowers with -f
++#   3. NO4C     - RAISED (line-anchored) parks, keeper lowers with -f;
++#                 MENTIONED (mid-prose) lifts with a NOTE (ruled 2026-07-08)
+ #   4. landing  - sha256 manifest verified at destination; receipt appended
+@@ -24,13 +25,11 @@
+   if ! "$lint" -s "$f" >/dev/null ; then
+     echo "PARK $b: path-lint -s failed (no lint pass, no MANIFEST)" ; rc=1 ; continue ; fi
+-    if grep -Eq '^[[:space:]]*#?N[O0]4C([[:space:]]|\]|$)' "$f" && test -z "$force" ; then
+-      echo "PARK $b: NO4C raised - keeper lowers with -f" ; rc=1 ; continue
+-    elif grep -Eq 'N[O0]4C' "$f" ; then
+-      echo "NOTE $b: NO4C mentioned (not raised) - lifting"
+-    fi
+-  if grep -q 'NO4C' "$f" && test -z "$force" ; then
+-    echo "PARK $b: NO4C raised (semantics provisional) - keeper lowers with -f" ; rc=1 ; continue ; fi
++  if grep -Eq '^[[:space:]]*#?N[O0]4C([[:space:]]|\]|$)' "$f" && test -z "$force" ; then
++    echo "PARK $b: NO4C raised - keeper lowers with -f" ; rc=1 ; continue
++  elif grep -Eq 'N[O0]4C' "$f" ; then
++    echo "NOTE $b: NO4C mentioned (not raised) - lifting"
++  fi
+   mkdir -p "$stage"
+
+# WHY: the old blanket block (any NO4C mention + no -f => PARK) ran AFTER the
+# ruled raise/mention split, so every MENTIONED file printed "NOTE ... lifting"
+# and then parked anyway - the 2026-07-08 ruling was dead code. Fail-closed,
+# so no exposure; but the fence parked traffic the ruling admits.
+# Note lift.sh itself says NO4C mid-prose only; post-fix it lifts as MENTIONED.
+# After applying on host: re-sign bin/lift.sh (detached, per adopted idiom).

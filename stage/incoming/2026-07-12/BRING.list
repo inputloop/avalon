@@ -1,0 +1,54 @@
+# BRING.list — what travels. The list is the authority; movepack never guesses.
+#
+# Lines are shell globs relative to the pack root (-r), '#' comments, and
+# deny rules prefixed '!'. A deny hit PARKS the whole pack — never a silent
+# skip, because a silent skip is how the wrong thing travels.
+#
+# Root for the Giza move: /f/claude   (pack:  movepack.sh pack -r /f/claude -o giza.tar.gz)
+# Landing on Giza:        /c/claude   (unpack: movepack.sh unpack -r /c/claude giza.tar.gz)
+#   Corwin's projects  ->  /c/claude/projects
+#   the instrument's   ->  /c/claude/projects  (the /c/c/p root; see MOVE-NOTES.md)
+
+# ---- deny rules first (they park; read them as the guard list) -------------
+!*/SAVANNAH/*
+!*SAVANNAH*
+!*/svhck/*
+!*/evidence/*
+!*/.git/*
+!*/.gnupg/*
+!*id_rsa*
+!*id_ed25519*
+!*.key
+!*secring*
+!*/node_modules/*
+!*.eclipse-increments/*
+
+# ---- the instrument's materials --------------------------------------------
+AS4CE/AS4CE0001/models
+AS4CE/AS4CE0001/skills
+AS4CE/AS4CE0001/journal
+AS4CE/AS4CE0001/memory
+AS4CE/AS4CE0001/book
+AS4CE/AS4CE0001/CLAUDE.md
+AS4CE/AS4CE0001/PLOT.md
+AS4CE/AS4CE0001/PLOT-UTIL.md
+AS4CE/AS4CE0001/model.md
+AS4CE/AS4CE0001/MEMORY.md
+
+# ---- projects (unredacted method + code; cases are denied above) ------------
+projects/Avalon
+projects/pmo
+projects/lab
+skills
+
+# ---- the shelf and the standing views --------------------------------------
+pub
+corwin/PRINCIPLES.md
+INTEL.md
+SEMAPHORES.md
+
+# ---- notes -----------------------------------------------------------------
+# Savannah materials NEVER ride this pack — they mount as D: on Giza when the
+# enclave is present, and travel by their own blessed path. The deny rules
+# above are the tripwire, not the policy: policy is the keeper's (S15 — a
+# guard is not a wall).

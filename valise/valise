@@ -1,0 +1,49 @@
+#!/bin/sh
+# valise — pack/unpack a travel set against a BRING list, with receipts.
+# Avalon law: POSIX sh, no dependencies beyond coreutils+tar+sha256sum.
+# Usage:
+#   valise check  LIST            validate the list; flag unsafe; print plan
+#   valise pack   LIST OUT.tgz    check, then tar + MANIFEST.sha256 + receipt
+#   valise verify OUT.tgz         verify archive against its .sha256 sidecar
+#   valise unpack OUT.tgz DEST    verify, then extract into DEST
+# LIST format: one path per line, relative to the list's own directory;
+#   blank lines and #-comments ignored.  Directories are taken whole.
+# SAFETY: paths matching the deny set are refused, never packed.  There is
+#   deliberately no --force; if it looks like a secret, it travels by hand
+#   or not at all.  SAVANNAH content is NEVER packed: a frozen placeholder
+#   is emitted instead (convention pending enclave blessing; see README).
+set -eu
+
+deny_match() {
+  # unsafe if the path smells like key material, credentials, or enclave
+  case "$1" in
+    *SAVANNAH*|*.gnupg*|*secring*|*id_rsa*|*id_ed25519*|*id_ecdsa*) return 0;;
+    *.key|*.pem|*private*key*|*password*|*credential*|*.kdbx) return 0;;
+    *) return 1;;
+  esac
+}
+
+read_list() { # $1=list  -> prints cleaned entries
+  sed -e 's/#.*$//' -e 's/[[:space:]]*$//' -e '/^$/d' "$1"
+}
+
+do_check() { # $1=list ; returns nonzero if any entry missing or unsafe
+  list=$1; base=$(dirname "$1"); bad=0
+  read_list "$list" | while IFS= read -r p; do
+    if deny_match "$p"; then printf 'UNSAFE  %s\n' "$p";
+    elif [ -e "$base/$p" ]; then printf 'OK      %s\n' "$p";
+    else printf 'MISSING %s\n' "$p"; fi
+  done | tee /tmp/valise.check.$$
+  if grep -q '^UNSAFE\|^MISSING' /tmp/valise.check.$$; then bad=1; fi
+  rm -f /tmp/valise.check.$$; return $bad
+}
+
+do_pack() { # $1=list $2=out.tgz
+  list=$1; out=$2; base=$(dirname "$1")
+  do_check "$list" || { echo "valise: refusing to pack (fix UNSAFE/MISSING above)"; exit 1; }
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # frozen-enclave placeholder rides along INSTEAD of any enclave content
+  printf '# SAVANNAH — FROZEN PLACEHOLDER\nThis valise carries no enclave content by design.\nConvention: placeholder only, like Corwin.md/corwin.txt vs installed\ninstruction. Real approach awaits enclave blessing.\npacked: %s\n' "$stamp" > "$base/PLACEHOLDER-SAVANNAH.md"
+  ( cd "$base" && read_list "$(basename "$list")" > /tmp/valise.files.$$ \
+    && printf 'PLACEHOLDER-SAVANNAH.md\n' >> /tmp/valise.files.$$ \
+    && print

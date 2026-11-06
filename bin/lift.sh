@@ -5,7 +5,8 @@
 #                 no sig, no lift
 #   2. dialect  - tools/path-lint.sh -s passes (PATH-DIALECT pin:
 #                 no lint pass, no MANIFEST)
-#   3. NO4C     - warn+PARK; semantics provisional; keeper lowers with -f
+#   3. NO4C     - RAISED (line-anchored) parks, keeper lowers with -f;
+#                 MENTIONED (mid-prose) lifts with a NOTE (ruled 2026-07-08)
 #   4. landing  - sha256 manifest verified at destination; receipt appended
 # Law: method travels, cases don't. The lifter cannot judge that - the
 # keeper reviews stage/incoming/ before anything promotes to tools/.
@@ -24,8 +25,11 @@ for f in "$@" ; do
     echo "PARK $b: signature does not verify vs pinned keys" ; rc=1 ; continue ; fi
   if ! "$lint" -s "$f" >/dev/null ; then
     echo "PARK $b: path-lint -s failed (no lint pass, no MANIFEST)" ; rc=1 ; continue ; fi
-  if grep -q 'NO4C' "$f" && test -z "$force" ; then
-    echo "PARK $b: NO4C raised (semantics provisional) - keeper lowers with -f" ; rc=1 ; continue ; fi
+  if grep -Eq '^[[:space:]]*#?N[O0]4C([[:space:]]|\]|$)' "$f" && test -z "$force" ; then
+    echo "PARK $b: NO4C raised - keeper lowers with -f" ; rc=1 ; continue
+  elif grep -Eq 'N[O0]4C' "$f" ; then
+    echo "NOTE $b: NO4C mentioned (not raised) - lifting"
+  fi
   mkdir -p "$stage"
   cp "$f" "$f.asc" "$stage"/ || { echo "FAIL $b: copy" ; rc=1 ; continue ; }
   ( cd "$stage" && sha256sum "$b" "$b.asc" >> MANIFEST.sha256 && sha256sum -c --quiet MANIFEST.sha256 ) \

@@ -1,0 +1,34 @@
+# av completion — source from ~/.bashrc:
+#     export AVALON=/f/claude/projects/Avalon
+#     export PATH="$AVALON/bin:$PATH"
+#     . "$AVALON/utils/av.bash-completion"
+#
+# The point is not saving keystrokes. It is that <TAB> recites the kit's SHAPE
+# back to you — so the hand moves while the head thinks, and a wrong shape
+# stops you before a wrong command runs.
+_av () {
+  local cur prev cmds
+  cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD-1]}
+  cmds="lift drop pack unpack lint verify check where help"
+  if test "$COMP_CWORD" -eq 1 ; then
+    COMPREPLY=( $(compgen -W "$cmds" -- "$cur") ) ; return
+  fi
+  case ${COMP_WORDS[1]} in
+    pack)   case $prev in
+              -o) COMPREPLY=( $(compgen -f -X '!*.tar.gz' -- "$cur") ) ;;
+              -l) COMPREPLY=( $(compgen -f -X '!*.list'   -- "$cur") ) ;;
+              -r) COMPREPLY=( $(compgen -d -- "$cur") ) ;;
+               *) COMPREPLY=( $(compgen -W "-n -l -r -o" -- "$cur") ) ;;
+            esac ;;
+    unpack) case $prev in
+              -r) COMPREPLY=( $(compgen -d -- "$cur") ) ;;
+               *) COMPREPLY=( $(compgen -f -X '!*.tar.gz' -- "$cur") ) ;;
+            esac ;;
+    lint)   COMPREPLY=( $(compgen -W "-s" -- "$cur") ; compgen -f -- "$cur" ) ;;
+    drop)   COMPREPLY=( $(compgen -f -- "${AVALON:-.}/tools/$cur") ) ;;
+    lift)   COMPREPLY=( $(compgen -W "-f" -- "$cur") ; compgen -f -- "$cur" ) ;;
+    *)      COMPREPLY=() ;;
+  esac
+}
+complete -F _av av
