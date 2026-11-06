@@ -1,0 +1,5 @@
+# avalon-healer runtime state (heartbeat, pid, seen sizes, job runs): never content (2026-11-06)
+healer/state/
+healer/**/run-*.log
+# a Windows task export carries the account SID: kept on Avalon, off the remote (2026-11-06)
+healer/jobs/*/original.xml

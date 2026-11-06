@@ -1,0 +1,776 @@
+#!/usr/bin/env perl
+# avalon-healer -- a local clerk for Avalon: watches disc space on its drives and on the seats
+# (the collections we keep), says in plain words what would free space, keeps an eye on
+# scheduled jobs, runs the Windows tasks we hand it, and carries out the moves we queue.
+#
+# Copyright (C) 2026 Corwin Brust <corwin@bru.st>
+# SPDX-License-Identifier: GPL-3.0-or-later
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3 of
+# the License, or (at your option) any later version.  This program is distributed in the hope
+# that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See <https://www.gnu.org/licenses/>.
+#
+# Run `avalon-healer help` for the commands, `avalon-healer COMMAND --help` for each one.
+#
+# THE COLLECTIONS are sparse: one folder per thing, one file per fact, one line per file.  A fact
+# not known is no file, never a placeholder.  seats/NAME (where a collection lives), jobs/NAME
+# (a scheduled job we watch or run), moves/ID (a queued move), rules/NAME (how a Windows task is
+# recognised as ours).  state/ is the tool's own: sizes last measured, history, heartbeat.
+# A seat's NAME is the key the lab's half of the locket can match later.
+#
+# What it never does on its own: delete or move anything of yours, adopt a Windows task, or
+# remove a move's source.  Moves run only when you queued them; a move removes its source only
+# when you said --remove-source, and only after every file's sha256 agrees on both sides.
+# Windows tasks are adopted only by `jobs --adopt NAME`, disabled (never deleted), and can always
+# be given back with `jobs --release NAME`.
+#
+# Mentat (for Corwin, claude-opus-5-5)
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptionsFromArray);
+use File::Find ();
+use File::Copy qw(copy);
+use Digest::SHA;
+use POSIX qw(strftime);
+use Time::Local qw(timelocal);
+use File::Basename qw(dirname basename);
+use File::Path qw(make_path);
+use File::Glob qw(bsd_glob);
+use Cwd qw(abs_path);
+use Encode qw(decode);
+
+$ENV{LC_ALL} = 'C';
+my $HERE = dirname(abs_path($0));
+my %O = (
+  seats => $ENV{AVALON_HEALER_SEATS} // "$HERE/seats",
+  state => $ENV{AVALON_HEALER_STATE} // "$HERE/state",
+  jobs  => $ENV{AVALON_HEALER_JOBS}  // "$HERE/jobs",
+  moves => $ENV{AVALON_HEALER_MOVES} // "$HERE/moves",
+  rules => $ENV{AVALON_HEALER_RULES} // "$HERE/rules",
+  df    => $ENV{AVALON_HEALER_DF},
+  du    => $ENV{AVALON_HEALER_DU} // 'du',
+  map   => [ split ' ', ($ENV{AVALON_HEALER_MAP} // '') ],
+  now   => $ENV{AVALON_HEALER_NOW},
+  today => $ENV{AVALON_HEALER_TODAY},
+  shown => $ENV{AVALON_HEALER_SHOWN} // 9,
+  schtasks => $ENV{AVALON_HEALER_SCHTASKS} // 'schtasks',
+  tight => 85, cap => 20, raw => 0, 'no-measure' => 0,
+);
+my $GRAIN = 4;
+my $MONTH_DAYS = 30;
+my $BULK_MB = 100;
+my $PLACEHOLDER = qr/^(?:|unknown|none|n\/a|na|tbd|todo|null|-|\?)$/i;
+my %KNOWN_SEAT_FACTS = map { $_ => 1 } qw(path drive role home home_path ignored note moved_from);
+my $IN_WATCH = 0;
+
+my %HELP = (
+  look => "look [--tight N] [--cap S] [--no-measure] [--trend]\n  Each drive: size, used, free, % used; the seats on it and their sizes.  --trend reads the history back.",
+  advise => "advise [--tight N] [--cap S] [--no-measure]\n  What would free space on tight drives, biggest gain first.  Recommends only.",
+  log => "log [--cap S] [--no-measure]\n  Append to the history what moved enough (a drive 1 point, a seat 1%).",
+  seats => "seats                                    the declaration, in words\n  seats --set NAME [--path P] [--drive D] [--role R] [--home H] [--home-path P] [--ignored yes] [--note T] [--fact K=V]\n  seats --set NAME --unset FACT            remove one fact (a fact not known is no file)",
+  jobs => "jobs                                     declared jobs, in words: due, late, failed, missing, paused\n  jobs --scan [--all]                      every Windows task, ours or not ours, with the reason\n  jobs --set NAME [--task T] [--source schtasks|loop] [--every 17m|1h|1d|1w] [--log-glob G] [--lock P] [--ok-marker P] [--note T]\n  jobs --set NAME --unset FACT\n  jobs --mine-rule NAME --match 'path F:\\claude' | 'msys WORD' | 'author corwi WORD'\n  jobs --adopt TASK                        take one of OUR Windows tasks into the healer's care (disables it in Windows)\n  jobs --release TASK                      give it back: re-enable it in Windows; watch stops running it",
+  move => "move --seat NAME --to PATH (--at YYYY-MM-DDTHH:MM | --when-tight) [--remove-source] [--margin-mb N]\n  Queue a move.  move --run ID [--remove-source] runs one now.  move --rollback ID removes a copy that did not finish.",
+  moves => "moves                                    the queue, in words\n  moves --cancel ID                        drop a queued move that has not started",
+  unmove => "unmove ID\n  Reverse a finished move: copy back, verify, then remove the moved copy; the seat path is restored.",
+  watch => "watch [--every 17m] [--once] [--passes N]\n  Runs until stopped (Ctrl-C, or `stop` from another shell).  Each pass: look, log, jobs, adopted\n  jobs that are due, moves that are due.  Writes state/heartbeat and state/watch.pid; one watcher at a time.",
+  stop => "stop\n  Ask a running watch to stop after its current step.",
+  status => "status\n  Is watch running?  Its pid and last heartbeat.",
+);
+
+# ================================================================================ small helpers
+sub say { print @_, "\n" }
+sub die2 { print STDERR "avalon-healer: @_\n"; exit 2 }
+sub refuse { print STDERR "avalon-healer: @_\n"; exit 1 }
+sub line1 { my $f = shift; open(my $h, '<', $f) or return undef; my $l = <$h>; close $h;
+  return undef unless defined $l; $l =~ s/[\r\n]+$//; return $l }
+sub put { my ($f, $v) = @_; make_path(dirname($f)); open(my $h, '>', $f) or die2("cannot write $f: $!"); print $h "$v\n"; close $h }
+sub lines_of { my $f = shift; open(my $h, '<', $f) or return (); my @l = map { s/[\r\n]+$//r } <$h>; close $h; @l }
+sub have { my $c = shift; return -x $c if $c =~ m{/}; for (split /:/, $ENV{PATH} // '') { return 1 if -x "$_/$c" || -x "$_/$c.exe" } 0 }
+sub dirs_in { my $d = shift; opendir(my $h, $d) or return (); my @n = sort grep { !/^\./ && -d "$d/$_" } readdir $h; closedir $h; @n }
+sub label { my $d = shift; length($d) == 1 ? "$d:" : $d }
+
+sub now_epoch {
+  if (defined $O{now} && $O{now} =~ /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)/) { return timelocal(0, $5, $4, $3, $2 - 1, $1) }
+  return time;
+}
+sub stamp { strftime('%Y-%m-%dT%H:%M', localtime(shift // now_epoch())) }
+sub today { $O{today} // strftime('%Y-%m-%d', localtime(now_epoch())) }
+sub parse_stamp { my $s = shift // return undef;
+  return timelocal($6 // 0, $5, $4, $3, $2 - 1, $1) if $s =~ /^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?/;
+  return timelocal(0, 0, 0, $3, $2 - 1, $1) if $s =~ /^(\d{4})-(\d\d)-(\d\d)$/;
+  undef }
+sub every_secs { my $e = shift // return undef; $e =~ /^(\d+)([smhdw]?)$/ or return undef;
+  $1 * { s => 1, '' => 1, m => 60, h => 3600, d => 86400, w => 604800 }->{$2} }
+
+sub human { my $kb = shift; return 'size not known' unless defined $kb && length $kb;
+  my ($v, $u) = ($kb + 0, 'KB');
+  for my $n (qw(MB GB TB)) { last if $v < 1024; $v /= 1024; $u = $n }
+  ($v >= 10 || $u eq 'KB') ? sprintf('%d %s', $v + 0.5, $u) : sprintf('%.1f %s', $v, $u) }
+
+sub jdn { my ($y, $m, $d) = @_; my $a = int((14 - $m) / 12); my $yy = $y + 4800 - $a; my $mm = $m + 12 * $a - 3;
+  $d + int((153 * $mm + 2) / 5) + 365 * $yy + int($yy / 4) - int($yy / 100) + int($yy / 400) - 32045 }
+
+sub mapped { my $p = shift; return $p unless defined $p;
+  for my $pair (@{ $O{map} }) { my ($from, $to) = split /=/, $pair, 2; next unless defined $to;
+    return $to . substr($p, length $from) if $p eq $from || index($p, "$from/") == 0 }
+  $p }
+sub drive_of_path { my $p = shift // return ''; return uc $1 if $p =~ m{^/([A-Za-z])(?:/|$)} || $p =~ /^([A-Za-z]):/; '' }
+
+# ---- facts: one file per fact; refuse placeholders --------------------------------------------
+sub fact { line1("$_[0]/$_[1]") }
+sub set_fact { my ($dir, $f, $v) = @_;
+  refuse("a fact name is lower-case letters and _ (got '$f')") unless $f =~ /^[a-z_]+$/;
+  (my $t = $v // '') =~ s/\s//g;
+  refuse("refusing '" . ($v // '') . "' for $f: a fact not known is no file (sparse); leave it out.") if $t =~ $PLACEHOLDER;  # PR:sparse-refuse
+  my $old = fact($dir, $f); put("$dir/$f", $v);
+  defined $old ? "$f was '$old', now '$v'" : "$f is now '$v'" }
+sub safe_name { my $n = shift; refuse("a name is letters, digits, . _ - (got '$n')") unless $n =~ /^[A-Za-z0-9_][A-Za-z0-9._-]*$/; $n }
+
+# ================================================================================ seats and drives
+sub read_seats {
+  my @s;
+  for my $n (dirs_in($O{seats})) {
+    my $d = "$O{seats}/$n"; my $p = fact($d, 'path');
+    my $dr = fact($d, 'drive') // drive_of_path($p); $dr =~ s/://g; $dr = uc $dr;
+    my $h = fact($d, 'home') // ''; $h =~ s/://g; $h = uc $h;
+    push @s, { name => $n, path => $p // '', mp => defined $p ? mapped($p) : '', drive => $dr, role => fact($d, 'role') // '',
+               home => $h, home_path => fact($d, 'home_path') // '', ignored => fact($d, 'ignored') // '', note => fact($d, 'note') };
+  }
+  @s }
+
+sub read_df {
+  my @l = defined $O{df} ? do { -r $O{df} or die2("cannot read $O{df}"); lines_of($O{df}) } : map { s/[\r\n]+$//r } `df -P 2>/dev/null`;
+  my (@d, %seen);
+  for my $i (1 .. $#l) {
+    my @f = split ' ', $l[$i]; next if @f < 6;
+    my ($mount, $pct, $av, $us, $sz) = ($f[-1], $f[-2], $f[-3], $f[-4], $f[-5]); $pct =~ s/%//;
+    my $dr = $f[0] =~ /^([A-Za-z]):/ ? uc $1 : $mount =~ m{^/([A-Za-z])$} ? uc $1 : $mount;
+    next if $seen{$dr}++;
+    push @d, { d => $dr, kb => $sz, used => $us, avail => $av, pct => $pct, mount => $mount };
+  }
+  @d }
+
+sub measure {
+  my $s = shift; my $c = "$O{state}/seen/$s->{name}";
+  my ($ckb, $cdate) = (line1("$c/kb"), line1("$c/date"));
+  return { st => 'nopath' } unless length $s->{mp};
+  if ($O{'no-measure'}) { return defined $ckb ? { kb => $ckb, st => 'cached', date => $cdate } : { st => 'none' } }
+  return { st => 'missing' } unless -d $s->{mp};
+  return { st => 'nocap' } unless have('timeout');
+  my $out = '';
+  if (open(my $h, '-|', 'timeout', $O{cap}, split(' ', $O{du}), '-sk', $s->{mp})) { local $/; $out = <$h> // ''; close $h }
+  my $rc = $? >> 8;
+  if ($rc == 0 && $out =~ /^(\d+)/) { put("$c/kb", $1); put("$c/date", today()); return { kb => $1, st => 'measured', date => today() } }
+  return { kb => $ckb, st => 'timeout', date => $cdate };  # PR:timeout-keeps-cache-apart
+}
+
+sub with_sizes { my @s = read_seats(); $_->{size} = measure($_) for @s; @s }
+
+sub inside { my ($s, $all) = @_;
+  for my $o (@$all) { next if $o == $s || !length $o->{mp}; return $o->{name} if index($s->{mp}, "$o->{mp}/") == 0 }
+  '' }
+
+sub sizeword { my $s = shift; my $z = $s->{size}; my $st = $z->{st};
+  return human($z->{kb}) . ' (measured now)' if $st eq 'measured';
+  return human($z->{kb}) . " (as last measured on $z->{date})" if $st eq 'cached';
+  return "not measured in $O{cap} s" . (defined $z->{kb} ? "; last measured " . human($z->{kb}) . " on $z->{date}" : '; size not known yet') if $st eq 'timeout';
+  return 'not measured (this shell has no timeout command to cap it)' if $st eq 'nocap';
+  return "not found at $s->{mp}" if $st eq 'missing';
+  return 'no path declared' if $st eq 'nopath';
+  'never measured' }
+
+sub seatline { my ($s, $all) = @_;
+  my $t = "    $s->{name}"; my $in = inside($s, $all); $t .= " (inside $in)" if length $in;
+  my @x; push @x, $s->{role} if length $s->{role}; push @x, 'git-ignored' if $s->{ignored} eq 'yes';
+  push @x, ($s->{home} eq $s->{drive} ? 'at its home' : 'meant for ' . label($s->{home})) if length $s->{home};
+  "$t: " . sizeword($s) . (@x ? '; ' . join(', ', @x) : '') . '.' }
+
+# ================================================================================ look / trend / log
+sub cmd_look {
+  my %a = @_;
+  return trend() if $a{trend};
+  my @d = read_df(); my @s = with_sizes();
+  if ($O{raw}) { say join("\t", $_->{d}, $_->{pct}, ($_->{pct} >= $O{tight} ? 'tight' : 'ok')) for @d; return }  # PR:tight-at-or-over
+  say 'Avalon on ', stamp(), ". A drive is called tight at $O{tight}% used or more.";
+  my %pc = map { $_->{d} => 1 } @d;
+  for my $d (@d) {
+    say ''; printf "%s %s in all, %s used, %s free, %s%% used.%s\n", label($d->{d}), human($d->{kb}), human($d->{used}), human($d->{avail}), $d->{pct}, ($d->{pct} >= $O{tight} ? ' TIGHT.' : '');
+    my @here = grep { $_->{drive} eq $d->{d} } @s;
+    if (@here) { say '  Seats here:'; say seatline($_, \@s) for @here } else { say '  No seats declared here.' }
+  }
+  my @blind = grep { !$pc{$_->{drive}} } @s;
+  if (@blind) { say ''; say 'Seats on drives this shell cannot see:';
+    say seatline($_, \@s), (length $_->{drive} ? ' (declared on ' . label($_->{drive}) . ')' : ' (no drive declared)') for @blind }
+  if (!@d) { say ''; say 'df gave no drives.' }
+  paused_line(); failing_lines() unless $IN_WATCH;
+}
+
+sub trend {
+  my $h = "$O{state}/history";
+  my @l = lines_of($h); unless (@l) { say 'No history yet: run avalon-healer log, then look --trend later.'; return }
+  my (@order, %n, %fv, %fd, %lv, %ld);
+  for (@l) { my ($t, $kind, $nm, $v) = split /\t/; my $k = "$kind\t$nm";
+    unless ($n{$k}) { push @order, $k; $fv{$k} = $v; $fd{$k} = $t } $n{$k}++; $lv{$k} = $v; $ld{$k} = $t }
+  say 'History, read back:';
+  for my $k (@order) {
+    my ($kind, $nm) = split /\t/, $k; my $who = $kind eq 'drive' ? "Drive $nm" : "Seat $nm";
+    my $show = sub { $kind eq 'drive' ? "$_[0]%" : human($_[0]) };
+    if ($n{$k} == 1) { printf "  %s: %s on %s (one reading).\n", $who, $show->($fv{$k}), $fd{$k}; next }
+    my $dv = $lv{$k} - $fv{$k}; my $pl = abs($dv) == 1 ? ' point' : ' points';
+    my $ch = $kind eq 'drive' ? ($dv > 0 ? "up $dv$pl" : $dv < 0 ? 'down ' . (-$dv) . $pl : 'no change')
+                              : ($dv > 0 ? 'grew ' . human($dv) : $dv < 0 ? 'shrank ' . human(-$dv) : 'no change');
+    printf "  %s: %s on %s, now %s on %s (%s; %d readings).\n", $who, $show->($fv{$k}), $fd{$k}, $show->($lv{$k}), $ld{$k}, $ch, $n{$k};
+  }
+}
+
+sub cmd_log {
+  my @d = read_df(); my @s = with_sizes();
+  my $h = "$O{state}/history"; make_path($O{state});
+  my %last; for (lines_of($h)) { my @f = split /\t/; $last{"$f[1]\t$f[2]"} = $f[3] }
+  my @now = ((map { ['drive', $_->{d}, $_->{pct}] } @d), (map { ['seat', $_->{name}, $_->{size}{kb}] } grep { defined $_->{size}{kb} } @s));
+  my @new;
+  for my $r (@now) { my $k = "$r->[0]\t$r->[1]"; my $v = $r->[2] + 0;
+    if (!exists $last{$k}) { push @new, $r; next }
+    my $p = $last{$k} + 0; my $dv = abs($v - $p);
+    if ($r->[0] eq 'drive') { push @new, $r if $dv >= 1 }  # PR:drive-point
+    else { push @new, $r if ($p == 0 && $v != 0) || ($p > 0 && $dv * 100 >= $p) } }
+  open(my $fh, '>>', $h) or die2("cannot append $h"); my $t = stamp();
+  print $fh join("\t", $t, @$_), "\n" for @new; close $fh;
+  say @new ? 'Logged ' . scalar(@new) . " change(s) to $h." : 'Nothing moved enough to log (a drive 1 point, a seat 1%).';
+}
+
+# ================================================================================ seats command
+sub cmd_seats {
+  my %a = @_;
+  if (defined $a{set}) {
+    my $n = safe_name($a{set}); my $dir = "$O{seats}/$n";
+    my %f = (path => $a{path}, drive => $a{drive}, role => $a{role}, home => $a{home}, home_path => $a{'home-path'}, ignored => $a{ignored}, note => $a{note});
+    for (@{ $a{fact} || [] }) { my ($k, $v) = split /=/, $_, 2; $f{$k} = $v }
+    my @said;
+    for my $k (sort keys %f) { next unless defined $f{$k}; push @said, set_fact($dir, $k, $f{$k}) }
+    for my $u (@{ $a{unset} || [] }) { refuse("bad fact name '$u'") unless $u =~ /^[a-z_]+$/;
+      if (-e "$dir/$u") { unlink "$dir/$u"; push @said, "$u removed" } else { push @said, "$u was not declared" } }
+    refuse('nothing to set: give --path, --home, --role, ... or --unset FACT') unless @said;
+    say "$n: ", join('; ', @said), '.'; return;
+  }
+  my @s = read_seats();
+  unless (@s) { say "No seats declared in $O{seats}."; return }
+  say "Seats declared in $O{seats} (one folder per seat, one file per fact; a fact not known is no file):";
+  for my $s (@s) {
+    my $t = "  $s->{name}: " . (length $s->{path} ? "at $s->{path}" : 'no path declared');
+    $t .= ' on ' . label($s->{drive}) if length $s->{drive};
+    $t .= ", role $s->{role}" if length $s->{role};
+    $t .= ', git-ignored' if $s->{ignored} eq 'yes';
+    $t .= length $s->{home} ? ", home $s->{home}:" . (length $s->{home_path} ? " ($s->{home_path})" : '') . ($s->{home} eq $s->{drive} ? ', kept' : ', NOT YET KEPT') : ', no home declared';
+    say "$t.";
+  }
+  for my $s (@s) { say "  Note on $s->{name}: $s->{note}" if defined $s->{note} }
+  for my $s (@s) { my $mf = fact("$O{seats}/$s->{name}", 'moved_from'); say "  $s->{name} was moved here from $mf." if defined $mf }
+}
+
+# ================================================================================ advise
+sub advice_rows {
+  my @d = read_df(); my @s = with_sizes();
+  my %tight = map { $_->{d} => 1 } grep { $_->{pct} >= $O{tight} } @d;
+  my (@rows, @partial);
+  for my $s (@s) { next unless $tight{$s->{drive}}; my $kb = $s->{size}{kb};
+    if (length $s->{home} && $s->{home} ne $s->{drive}) { push @rows, { d => $s->{drive}, k => 'b', kb => $kb, subj => $s->{name}, s => $s }; next }  # PR:appointment
+    if ($s->{ignored} eq 'yes' && (!defined $kb || $kb >= $BULK_MB * 1024)) { push @rows, { d => $s->{drive}, k => 'c', kb => $kb, subj => $s->{name}, s => $s } } }
+  my ($ty, $tm, $td) = split /-/, today(); my $cutoff = jdn($ty, $tm, $td) - $MONTH_DAYS;
+  my @scan = grep { $tight{$_->{drive}} && length $_->{mp} } @s;
+  my %f;
+  for my $s (@scan) {
+    next if grep { index($s->{mp}, "$_->{mp}/") == 0 } @scan;
+    next unless -d $s->{mp};
+    my $deadline = time + $O{cap}; my $cut = 0;
+    File::Find::find({ no_chdir => 1, wanted => sub {
+      if (time > $deadline) { $cut = 1; $File::Find::prune = 1; return }
+      my $base = basename($File::Find::name);
+      if (-d $File::Find::name) { $File::Find::prune = 1 if $base eq '_to_delete' || $base eq '.git'; return }
+      return unless -f _; return if $base =~ /\.dp1le\.tar\.gz$/;
+      return unless $base =~ /((?:19|20)[0-9][0-9]-?[01][0-9]-?[0-3][0-9])/;
+      (my $x = $1) =~ s/-//g; my ($y, $m, $dd) = (substr($x, 0, 4) + 0, substr($x, 4, 2) + 0, substr($x, 6, 2) + 0);
+      return if $m < 1 || $m > 12 || $dd < 1 || $dd > 31;
+      return if jdn($y, $m, $dd) >= $cutoff;  # PR:older-than-month
+      my $k = $File::Find::dir; my $r = $f{$k} //= { d => $s->{drive}, n => 0, by => 0 };
+      $r->{n}++; $r->{by} += -s $File::Find::name;
+      $r->{old} = $x if !defined $r->{old} || $x lt $r->{old}; $r->{new} = $x if !defined $r->{new} || $x gt $r->{new};
+    } }, $s->{mp});
+    push @partial, $s->{name} if $cut;
+  }
+  for my $k (keys %f) { my $r = $f{$k}; next if $r->{n} < $GRAIN;
+    push @rows, { d => $r->{d}, k => 'a', kb => int($r->{by} / 1024), subj => $k, n => $r->{n}, old => $r->{old}, new => $r->{new} } }
+  @rows = sort { $a->{d} cmp $b->{d} || ($b->{kb} // -1) <=> ($a->{kb} // -1) || $a->{k} cmp $b->{k} || $a->{subj} cmp $b->{subj} } @rows;  # PR:gain-order
+  return (\@rows, \@d, \%tight, \@partial);
+}
+
+sub cmd_advise {
+  my ($rows, $d, $tight, $partial) = advice_rows();
+  if ($O{raw}) { say join("\t", $_->{d}, $_->{k}, $_->{kb} // '', $_->{subj}) for @$rows; return }
+  unless (%$tight) { say "No drive is $O{tight}% used or more. Nothing to advise."; return }
+  my %dd = map { $_->{d} => $_ } @$d; my ($cur, $i, %piles, %more, %morekb) = ('', 0);
+  my $ymd = sub { my $s = shift; substr($s, 0, 4) . '-' . substr($s, 4, 2) . '-' . substr($s, 6, 2) };
+  for my $r (@$rows) {
+    if ($r->{d} ne $cur) { $cur = $r->{d}; $i = 0; say ''; printf "%s is %s%% used (%s free). What would free space there, biggest gain first:\n", label($cur), $dd{$cur}{pct}, human($dd{$cur}{avail}) }
+    if ($r->{k} eq 'a' && ++$piles{$cur} > $O{shown}) { $more{$cur}++; $morekb{$cur} += $r->{kb}; next }
+    $i++;
+    my $gain = defined $r->{kb} ? 'about ' . human($r->{kb}) : "its size (not known yet: not measured in $O{cap} s)";
+    if ($r->{k} eq 'b') { my $s = $r->{s};
+      printf "  %d. Appointment not yet kept: seat %s (%s) is on %s, but its home is %s%s. Moving it would free %s on %s.\n", $i, $s->{name}, (length $s->{role} ? $s->{role} : 'no role declared'), label($cur), label($s->{home}), (length $s->{home_path} ? " ($s->{home_path})" : ''), $gain, label($cur);
+      printf "     To queue it: avalon-healer move --seat %s --to %s --when-tight\n", $s->{name}, $s->{home_path} if length $s->{home_path} }
+    elsif ($r->{k} eq 'c') { printf "  %d. Large ignored bulk: seat %s is git-ignored, holds %s, and has no other home declared.\n", $i, $r->{subj}, (defined $r->{kb} ? human($r->{kb}) : "a size not known yet (not measured in $O{cap} s; it may be large)") }
+    else { printf "  %d. Date pile: %s holds %d files dated %s, older than a month (about %s now). dp1le can pile them into verified .tar.gz it reads back in place: dp1le plan \"%s\"\n", $i, $r->{subj}, $r->{n}, ($r->{old} eq $r->{new} ? $ymd->($r->{old}) : $ymd->($r->{old}) . ' to ' . $ymd->($r->{new})), human($r->{kb}), $r->{subj} }
+  }
+  printf "  And %d smaller date pile(s) on %s, about %s in all (the biggest %d are shown).\n", $more{$_}, label($_), human($morekb{$_}), $O{shown} for sort keys %more;
+  say ''; say 'Gains overlap where one sits inside another (a seat inside a seat, a folder inside a seat); they are not added up.';
+  say 'A date pile frees space only after its originals are pruned, and pruning is yours.';
+  say "Not fully scanned in $O{cap} s, so date piles there may be missing: @$partial" if @$partial;
+  say 'This only recommends. Nothing was moved or deleted.';
+}
+
+# ================================================================================ Windows tasks
+sub parse_csv_line { my $l = shift; my @f; while (length $l) {
+    if ($l =~ s/^"((?:[^"]|"")*)"(?:,|$)//) { (my $v = $1) =~ s/""/"/g; push @f, $v }
+    elsif ($l =~ s/^([^,]*)(?:,|$)//) { push @f, $1 } else { last } } @f }
+
+sub run_schtasks { my @args = @_;   # returns (exit, output bytes)
+  return (127, '') unless have($O{schtasks});
+  local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+  open(my $h, '-|', $O{schtasks}, @args) or return (127, '');
+  binmode $h; local $/; my $out = <$h> // ''; close $h; return ($? >> 8, $out) }
+
+sub read_tasks {
+  my ($rc, $out) = run_schtasks('/query', '/fo', 'CSV', '/v');
+  return undef if $rc == 127;
+  my (@hdr, %t, @order);
+  for my $l (split /\r?\n/, $out) { next unless length $l; my @f = parse_csv_line($l);
+    if (($f[0] // '') eq 'HostName' || ($f[1] // '') eq 'TaskName') { @hdr = @f; next }
+    next unless @hdr; my %r; @r{@hdr} = @f; my $n = $r{TaskName} // next;
+    next if $t{$n}; $t{$n} = \%r; push @order, $n }
+  return { tasks => \%t, order => \@order } }
+
+sub task_time { my $s = shift // return undef;   # "11/6/2026 5:53:00 AM", "2026-11-06 05:53:00"
+  return parse_stamp($s) if $s =~ /^\d{4}-/;
+  return undef unless $s =~ m{^(\d+)/(\d+)/(\d{4})\s+(\d+):(\d\d)(?::(\d\d))?\s*([AP]M)?}i;
+  my ($mo, $d, $y, $h, $mi, $se, $ap) = ($1, $2, $3, $4, $5, $6 // 0, $7);
+  return undef if $y < 2000;
+  if ($ap) { $h %= 12; $h += 12 if uc $ap eq 'PM' }
+  timelocal($se, $mi, $h, $d, $mo - 1, $y) }
+
+sub task_key { my $n = shift; $n = "\\$n" unless $n =~ /^\\/; $n }
+sub job_slug { my $n = shift; $n =~ s/^\\+//; $n =~ s/[^A-Za-z0-9._-]+/_/g; $n }
+
+sub read_rules { my @r; opendir(my $h, $O{rules}) or return ();
+  for my $n (sort grep { !/^\./ && -f "$O{rules}/$_" } readdir $h) {
+    my $l = line1("$O{rules}/$n") // next; my ($k, $v) = split ' ', $l, 2; push @r, [$n, $k, $v // ''] }
+  closedir $h; @r }
+
+sub pathforms { my $v = lc shift; $v =~ s{\\}{/}g; $v =~ s{/+$}{}; my @f = ($v);
+  push @f, "/$1$2" if $v =~ m{^([a-z]):(/.*)?$} && defined $2; push @f, "/$1" if $v =~ m{^([a-z]):$}; @f }
+
+sub broad_path { my $v = shift; $v =~ s{[\\/]+$}{}; $v =~ /^(?:[A-Za-z]:|\/[A-Za-z]?|)$/ }   # a whole drive is never "ours"
+sub classify { my ($t, $rules) = @_;
+  (my $run = lc($t->{'Task To Run'} // '')) =~ s{\\}{/}g; (my $dir = lc($t->{'Start In'} // '')) =~ s{\\}{/}g;
+  my $author = lc($t->{Author} // ''); my $tn = lc($t->{TaskName} // '');
+  for my $r (@$rules) { my ($rn, $k, $v) = @$r;
+    if ($k eq 'path') { next if broad_path($v); for my $p (pathforms($v)) {
+        return (1, "its action runs from under $v (rule $rn)") if index($run, $p) >= 0;
+        return (1, "it starts in $v (rule $rn)") if index($dir, $p) >= 0 } }
+    elsif ($k eq 'msys') { return (1, "it runs $v through msys64 (rule $rn)") if $run =~ /msys64/ && index($run, lc $v) >= 0 }
+    elsif ($k eq 'author') { my ($who, $word) = split ' ', $v, 2; next unless defined $word;
+      return (1, "its author is $who and its name has '$word' (rule $rn)") if index($author, lc $who) >= 0 && index($tn, lc $word) >= 0 } }
+  return (0, 'no rule of ours matched (author ' . ($t->{Author} || 'not given') . ', runs ' . ($t->{'Task To Run'} || 'nothing given') . ')') }
+
+sub read_jobs { my @j; for my $n (dirs_in($O{jobs})) { my $d = "$O{jobs}/$n"; my %f = (name => $n, dir => $d);
+    for my $k (qw(task source every log_glob lock ok_marker note adopted command arguments workdir start released)) { $f{$k} = fact($d, $k) }
+    push @j, \%f } @j }
+
+# ---- watch liveness ------------------------------------------------------------------------------
+sub watch_live { my $lock = "$O{state}/watch.lock"; return 0 unless -d $lock;
+  my $pid = line1("$O{state}/watch.pid"); return 1 if $pid && $pid =~ /^\d+$/ && kill(0, $pid);
+  my $hb = line1("$O{state}/heartbeat"); my ($t, $ev) = split ' ', ($hb // ''); my $e = parse_stamp($t);
+  my $every = every_secs($ev) // 1020;
+  return 1 if defined $e && time - $e < 2 * $every + 120;
+  0 }
+
+sub paused_line { return if $IN_WATCH; my @a = grep { defined $_->{adopted} } read_jobs(); return unless @a;
+  return if watch_live();
+  say ''; say scalar(@a), ' adopted job(s) paused: watch is not running (' . join(', ', map { $_->{name} } @a) . ').';
+  say '  Start it with: perl avalon-healer watch    To give a job back to Windows instead: perl avalon-healer jobs --release TASK' }
+
+# ---- jobs report ------------------------------------------------------------------------------------
+sub job_state { my $j = shift; my $d = "$O{state}/jobs/$j->{name}"; map { $_ => line1("$d/$_") } qw(last_run exit log) }
+
+sub cmd_jobs {
+  my %a = @_;
+  return jobs_set(%a) if defined $a{set};
+  return mine_rule(%a) if defined $a{'mine-rule'};
+  return adopt($a{adopt}) if defined $a{adopt};
+  return release($a{release}) if defined $a{release};
+  return scan(%a) if $a{scan};
+  jobs_report();
+}
+
+sub jobs_set { my %a = @_; my $n = safe_name($a{set}); my $dir = "$O{jobs}/$n"; my @said;
+  my %f = (task => $a{task}, source => $a{source}, every => $a{every}, log_glob => $a{'log-glob'}, lock => $a{lock}, ok_marker => $a{'ok-marker'}, note => $a{note});
+  refuse("--every wants a number and m, h, d or w (got '$f{every}')") if defined $f{every} && !defined every_secs($f{every});
+  for my $k (sort keys %f) { push @said, set_fact($dir, $k, $f{$k}) if defined $f{$k} }
+  for my $u (@{ $a{unset} || [] }) { if (-e "$dir/$u") { unlink "$dir/$u"; push @said, "$u removed" } else { push @said, "$u was not declared" } }
+  refuse('nothing to set') unless @said; say "job $n: ", join('; ', @said), '.' }
+
+sub mine_rule { my %a = @_; my $n = safe_name($a{'mine-rule'}); my $m = $a{match} // refuse("--mine-rule wants --match 'path F:\\claude' (or 'msys WORD', 'author WHO WORD')");
+  my ($k, $v) = split ' ', $m, 2; refuse("a path rule must name a folder, not a whole drive (got '$v')") if $k && $k eq 'path' && defined $v && broad_path($v);
+  refuse("a rule is 'path P', 'msys WORD' or 'author WHO WORD' (got '$m')") unless $k && $k =~ /^(?:path|msys|author)$/ && defined $v && $v !~ $PLACEHOLDER;
+  put("$O{rules}/$n", "$k $v"); say "rule $n: $k $v." }
+
+sub scan { my %a = @_;
+  my $T = read_tasks(); unless ($T) { say 'Task Scheduler is not reachable from this shell (no schtasks command).'; return }
+  my @rules = read_rules(); my (@ours, @not); my $ms = 0;
+  for my $n (@{ $T->{order} }) { my ($ok, $why) = classify($T->{tasks}{$n}, \@rules);
+    if ($ok) { push @ours, [$n, $why] } elsif (!$a{all} && $n =~ /^\\Microsoft\\/) { $ms++ } else { push @not, [$n, $why] } }
+  say 'Windows tasks that are ours (', scalar(@ours), '):'; say "  $_->[0]: ours, because $_->[1]." for @ours; say '  none' unless @ours;
+  say 'Windows tasks that are not ours (', scalar(@not) + $ms, '; never touched):'; say "  $_->[0]: not ours: $_->[1]." for @not;
+  say "  and $ms under \\Microsoft\\ (listed with --all)." if $ms;
+  say 'To take one of ours into the healer\'s care: perl avalon-healer jobs --adopt TASK  (this disables it in Windows; --release gives it back).' if @ours }
+
+sub iso_minutes { my $d = shift // return undef; $d =~ /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$/ or return undef;
+  (($1 // 0) * 1440) + (($2 // 0) * 60) + ($3 // 0) }
+sub xml_text { my $x = shift; return undef unless defined $x; $x =~ s/&quot;/"/g; $x =~ s/&apos;/'/g; $x =~ s/&lt;/</g; $x =~ s/&gt;/>/g; $x =~ s/&amp;/&/g; $x }
+
+sub adopt { my $name = task_key(shift);
+  my $T = read_tasks() // refuse('Task Scheduler is not reachable from this shell (no schtasks command).');
+  my $t = $T->{tasks}{$name} // refuse("no Windows task named $name.");
+  my ($ours, $why) = classify($t, [read_rules()]);
+  refuse("$name is not ours ($why); the healer never touches it.") unless $ours;  # PR:adopt-only-ours
+  my $slug = job_slug($name); my $dir = "$O{jobs}/$slug";
+  refuse("$name is already adopted (jobs/$slug).") if defined fact($dir, 'adopted');
+  my ($rc, $xml) = run_schtasks('/query', '/tn', $name, '/xml');
+  refuse("could not export $name (schtasks exit $rc); nothing changed.") if $rc || !length $xml;
+  make_path($dir); open(my $h, '>', "$dir/original.xml") or die2("cannot write $dir/original.xml"); binmode $h; print $h $xml; close $h;
+  my $x = $xml; if ($x =~ /\x00/) { $x =~ s/^\xFF\xFE//; $x = decode('UTF-16LE', $x) }
+  my %f = (task => $name, source => 'adopted');
+  $f{command} = xml_text($1) if $x =~ m{<Command>(.*?)</Command>}s;
+  $f{arguments} = xml_text($1) if $x =~ m{<Arguments>(.*?)</Arguments>}s;
+  $f{workdir} = xml_text($1) if $x =~ m{<WorkingDirectory>(.*?)</WorkingDirectory>}s;
+  $f{start} = $1 if $x =~ m{<StartBoundary>(.*?)</StartBoundary>}s;
+  my $min = $x =~ m{<Repetition>.*?<Interval>(.*?)</Interval>}s ? iso_minutes($1) : undef;
+  if (defined $min && $min > 0) { $f{every} = $min % 1440 == 0 ? ($min / 1440) . 'd' : $min % 60 == 0 ? ($min / 60) . 'h' : "${min}m" }
+  elsif ($x =~ m{<ScheduleByDay>.*?<DaysInterval>(\d+)</DaysInterval>}s) { $f{every} = "$1d" }
+  elsif ($x =~ m{<ScheduleByWeek>.*?<WeeksInterval>(\d+)</WeeksInterval>}s) { $f{every} = "$1w" }
+  refuse("$name has no command in its definition; not adopted (original.xml kept in jobs/$slug).") unless defined $f{command};
+  put("$dir/$_", $f{$_}) for grep { defined $f{$_} && length $f{$_} } keys %f;
+  ($rc) = run_schtasks('/change', '/tn', $name, '/disable');  # PR:disable-not-delete
+  my $after = read_tasks(); my $st = $after && $after->{tasks}{$name} ? $after->{tasks}{$name}{'Scheduled Task State'} // '' : 'gone';
+  if ($rc || $st ne 'Disabled') { refuse("could not disable $name in Windows (exit $rc, state now '$st'); it is NOT adopted, so it will not run twice. Its facts are in jobs/$slug.") }
+  put("$dir/adopted", stamp());
+  say "Adopted $name as job $slug: " . ($f{every} ? "every $f{every}" : 'no repeating trigger found, so watch will not run it until you give it --every') . ", runs $f{command}" . ($f{arguments} ? " $f{arguments}" : '') . '.';
+  say "Its Windows definition is saved verbatim in jobs/$slug/original.xml; the Windows task is disabled, not deleted.";
+  say 'It runs only while watch is running.' . (watch_live() ? '' : ' Watch is not running now.');
+  say "To give it back to Windows: perl avalon-healer jobs --release '$name'" }
+
+sub release { my $name = task_key(shift); my $slug = job_slug($name); my $dir = "$O{jobs}/$slug";
+  refuse("$name is not adopted.") unless defined fact($dir, 'adopted');
+  my ($rc) = run_schtasks('/change', '/tn', $name, '/enable');  # PR:release-enables
+  my $after = read_tasks(); my $st = $after && $after->{tasks}{$name} ? $after->{tasks}{$name}{'Scheduled Task State'} // '' : 'gone';
+  refuse("could not re-enable $name in Windows (exit $rc, state now '$st'); it stays adopted, so it is not lost.") if $rc || $st ne 'Enabled';
+  unlink "$dir/adopted"; put("$dir/released", stamp());
+  say "Released $name: Windows runs it again; watch will not. Its record stays in jobs/$slug." }
+
+sub jobs_report {
+  my @j = read_jobs(); my $T = read_tasks(); my @rules = read_rules(); my $now = now_epoch();
+  my %declared = map { (task_key($_->{task} // $_->{name}) => 1) } @j;
+  my $live = $IN_WATCH || watch_live();
+  unless (@j) { say "No jobs declared in $O{jobs}." }
+  else { say 'Jobs:' }
+  for my $j (@j) {
+    my $ev = every_secs($j->{every}); my $t = "  $j->{name}";
+    if (defined $j->{adopted}) {
+      my %s = job_state($j); my $lr = parse_stamp($s{last_run});
+      my $due = !defined $lr || (defined $ev && $lr + $ev <= $now);
+      $t .= ': adopted' . ($j->{every} ? ", every $j->{every}" : ', no cadence (give it --every)');
+      $t .= defined $s{last_run} ? "; last run $s{last_run}, exit $s{exit}" . (defined $s{log} ? ", log $s{log}" : '') : '; not run by the healer yet';
+      $t .= !$live ? '; PAUSED (watch is not running)' : ($ev && $due) ? '; due now' : $ev ? '; next ' . stamp($lr + $ev) : '';
+      if (defined $s{exit} && $s{exit} ne '0') { my $e = line1("$O{state}/jobs/$j->{name}/error"); my $f = line1("$O{state}/jobs/$j->{name}/fails") // 1;
+        $t .= "; FAILED last time (exit $s{exit}" . ($f > 1 ? ", $f in a row" : '') . ')' . (defined $e ? ": $e" : '') }
+      say "$t."; next }
+    my $src = $j->{source} // 'schtasks';
+    my $okm = defined $j->{ok_marker} ? (stat(mapped($j->{ok_marker})))[9] : undef;
+    if ($src eq 'loop') {
+      my $lock = defined $j->{lock} ? mapped($j->{lock}) : undef;
+      my @logs = defined $j->{log_glob} ? bsd_glob(mapped($j->{log_glob})) : ();
+      my ($newest, $nt) = (undef, 0); for (@logs) { my $m = (stat $_)[9]; ($newest, $nt) = ($_, $m) if $m > $nt }
+      my $last = $okm // ($nt || undef);
+      if ($lock && -e $lock) { my $who = line1("$lock/who"); $t .= ': running now' . ($who ? " ($who)" : '') }
+      elsif (!@logs && !defined $okm) { $t .= ': MISSING: no lock and no log found' . (defined $j->{log_glob} ? " at $j->{log_glob}" : '') }  # PR:job-missing-loop
+      else { $t .= ': not running' }
+      $t .= '; last ' . (defined $okm ? 'ok' : 'log') . ' ' . stamp($last) . ($newest && !defined $okm ? " ($newest)" : '') if $last;
+      $t .= '; LATE (expected every ' . $j->{every} . ')' if $ev && $last && $now - $last > 1.5 * $ev;
+      say "$t."; next }
+    unless ($T) { say "$t: not checked: Task Scheduler is not reachable from this shell."; next }
+    my $task = $T->{tasks}{ task_key($j->{task} // $j->{name}) };
+    unless ($task) { say "$t: MISSING: Windows has no task named " . task_key($j->{task} // $j->{name}) . '.'; next }  # PR:job-missing
+    my $res = $task->{'Last Result'} // ''; my $code = $res =~ /^-?\d+$/ ? $res + 0 : undef;
+    my $lr = task_time($task->{'Last Run Time'}); my $nr = task_time($task->{'Next Run Time'});
+    my $last = $okm // ((defined $code && $code == 0) ? $lr : undef);
+    my @w;
+    push @w, 'disabled in Windows' if ($task->{'Scheduled Task State'} // '') eq 'Disabled';
+    if (defined $code) { if ($code == 267009) { push @w, 'running now' } elsif ($code == 267011) { push @w, 'has never run' }
+      elsif ($code != 0) { push @w, sprintf('FAILED last time (result 0x%X)', $code & 0xFFFFFFFF) } }
+    push @w, 'LATE (expected every ' . $j->{every} . ')' if $ev && (!defined $last || $now - $last > 1.5 * $ev) && !grep { /never run/ } @w;
+    push @w, 'due ' . ($nr <= $now ? 'now' : 'at ' . stamp($nr)) if defined $nr && $nr <= $now + 1020;
+    push @w, 'ok' unless @w;
+    say "$t: ", join('; ', @w), (defined $lr ? '; last run ' . stamp($lr) : ''), '.';
+  }
+  say '(Task Scheduler is not reachable from this shell, so Windows tasks were not checked.)' unless $T;
+  if ($T) { my $sd = "$O{state}/seen-jobs"; my @new;
+    for my $n (@{ $T->{order} }) { next if $declared{$n} || $n =~ /^\\Microsoft\\/; my $s = job_slug($n); next if -e "$sd/$s";
+      my ($ok, $why) = classify($T->{tasks}{$n}, \@rules); push @new, "  $n (" . ($ok ? 'ours' : 'not ours') . ": $why)"; put("$sd/$s", $n) }
+    if (@new) { say 'Seen, not watched (said once; declare one with jobs --set NAME --task TASK):'; say $_ for @new } }
+  paused_line(); failing_lines() unless $IN_WATCH;
+}
+
+sub windows_runner { return $ENV{AVALON_HEALER_CMD} if $ENV{AVALON_HEALER_CMD}; return 'cmd.exe' if $^O eq 'msys' || $^O eq 'MSWin32' || $^O eq 'cygwin'; undef }
+
+# An adopted job runs through a small wrapper, state/jobs/NAME/run.cmd, so cmd.exe is handed one
+# plain path and no quoted string: cmd /c strips the first and last quote of a line that holds
+# more than two, and MSYS adds \" escapes cmd does not read, so a quoted line never ran.
+sub write_wrapper { my ($j, $sd, $log) = @_;
+  my $cmd = $j->{command}; my $args = $j->{arguments} // ''; $args =~ s/%/%%/g;
+  my @l = ('@echo off');
+  push @l, sprintf('cd /d "%s"', $j->{workdir}) if defined $j->{workdir} && length $j->{workdir};
+  push @l, sprintf('call "%s"%s > "%s" 2>&1', $cmd, (length $args ? " $args" : ''), local_to_win($log));
+  push @l, 'exit /b %ERRORLEVEL%';
+  open(my $h, '>', "$sd/run.cmd") or die2("cannot write $sd/run.cmd"); binmode $h; print $h join("\r\n", @l), "\r\n"; close $h;
+  "$sd/run.cmd" }
+
+sub run_due_jobs { my $now = now_epoch(); my $n = 0;
+  for my $j (grep { defined $_->{adopted} } read_jobs()) {
+    my $ev = every_secs($j->{every}) // next; my %s = job_state($j); my $lr = parse_stamp($s{last_run});
+    next unless !defined $lr || $lr + $ev <= $now;  # PR:adopted-due
+    my $sd = "$O{state}/jobs/$j->{name}"; make_path($sd);
+    my $log = "$sd/run-" . strftime('%Y%m%d-%H%M%S', localtime) . '.log';
+    { open(my $h, '>', $log) or die2("cannot create $log: $!"); close $h }   # the log exists before the job runs
+    my $rc; my $runner = windows_runner();
+    if (defined $runner) {
+      my $wrap = write_wrapper($j, $sd, $log);
+      local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+      my $cline = local_to_win($wrap);  # PR:runner-no-quotes
+      $rc = system($runner, '/d', '/c', $cline) }
+    else { my $wd = defined $j->{workdir} ? win_to_local($j->{workdir}) : undef; my $cwd = abs_path('.');
+      chdir $wd if defined $wd && -d $wd;
+      $rc = system('sh', '-c', "$j->{command} " . ($j->{arguments} // '') . " > '$log' 2>&1"); chdir $cwd }
+    my $exit = $rc == -1 ? 127 : $rc >> 8;
+    put("$sd/last_run", stamp($now)); put("$sd/exit", $exit); put("$sd/log", $log);
+    if ($exit == 0) { unlink "$sd/fails", "$sd/error" }
+    else { put("$sd/fails", (line1("$sd/fails") // 0) + 1);
+      my ($err) = grep { /\S/ } lines_of($log); $err //= 'the job wrote nothing to its log';
+      $err =~ s/\s+$//; put("$sd/error", substr($err, 0, 300)) }
+    say "  Ran adopted job $j->{name}: exit $exit, log $log." . ($exit ? ' Error: ' . line1("$sd/error") : ''); $n++ }
+  failing_lines() if $n;
+  $n }
+
+sub failing_lines { my $printed = 0;
+  for my $j (grep { defined $_->{adopted} } read_jobs()) { my $sd = "$O{state}/jobs/$j->{name}"; my $f = line1("$sd/fails") // 0;
+    next unless $f >= 3;  # PR:loud-after-three
+    say '' unless $printed++;
+    say "!! Adopted job $j->{name} has FAILED $f times in a row (last: " . (line1("$sd/last_run") // '?') . ', exit ' . (line1("$sd/exit") // '?') . '): ' . (line1("$sd/error") // 'no error text') . '.';
+    say "   It is not doing its work. To hand it back to Windows: perl avalon-healer jobs --release '" . task_key($j->{task} // $j->{name}) . "'" }
+  $printed }
+
+sub win_to_local { my $p = shift; return $p unless $p =~ /^([A-Za-z]):[\\\/]?(.*)$/; (my $r = $2) =~ s{\\}{/}g; mapped('/' . lc($1) . '/' . $r) }
+sub local_to_win { my $p = shift; return $p unless $p =~ m{^/([a-z])/(.*)$}; (my $r = $2) =~ s{/}{\\}g; uc($1) . ":\\$r" }
+
+# ================================================================================ moves
+sub mdir { "$O{moves}/$_[0]" }
+sub mget { my $id = shift; my $d = mdir($id); return undef unless -d $d;
+  my %m = (id => $id); $m{$_} = fact($d, $_) for qw(seat from to at when_tight remove_source margin_mb state queued note to_drive); \%m }
+
+sub cmd_move { my %a = @_;
+  return run_move($a{run}, $a{'remove-source'}) if defined $a{run};
+  return rollback_cmd($a{rollback}) if defined $a{rollback};
+  my $seat = $a{seat} // refuse('move wants --seat NAME (or --run ID)'); my $to = $a{to} // refuse('move wants --to PATH');
+  my $sd = "$O{seats}/" . safe_name($seat); my $from = fact($sd, 'path') // refuse("seat $seat has no path declared.");
+  refuse('move wants --at YYYY-MM-DDTHH:MM or --when-tight') unless defined $a{at} || $a{'when-tight'};
+  refuse("--at wants YYYY-MM-DDTHH:MM (got '$a{at}')") if defined $a{at} && !defined parse_stamp($a{at});
+  refuse("--to $to is the seat's own path") if $to eq $from;
+  refuse("--to $to is inside the seat") if index($to, "$from/") == 0;
+  my $id = strftime('%Y%m%d-%H%M', localtime(now_epoch())) . "-$seat"; my $k = 1; $id = strftime('%Y%m%d-%H%M', localtime(now_epoch())) . "-$seat-" . ++$k while -e mdir($id);
+  my $d = mdir($id);
+  put("$d/seat", $seat); put("$d/from", $from); put("$d/to", $to); put("$d/state", 'queued'); put("$d/queued", stamp());
+  put("$d/at", $a{at}) if defined $a{at}; put("$d/when_tight", 'yes') if $a{'when-tight'};
+  put("$d/remove_source", 'yes') if $a{'remove-source'}; put("$d/margin_mb", $a{'margin-mb'}) if defined $a{'margin-mb'};
+  say "Queued move $id: seat $seat from $from to $to, " . (defined $a{at} ? "at $a{at}" : 'when its drive is tight') . ($a{'remove-source'} ? ', removing the source after every file is verified.' : ', keeping the source (space is freed only when you finish it with --remove-source).');
+  say 'It runs only while watch is running, or when you run: perl avalon-healer move --run ' . $id }
+
+sub cmd_moves { my %a = @_;
+  if (defined $a{cancel}) { my $m = mget($a{cancel}) // refuse("no move $a{cancel}.");
+    refuse("move $a{cancel} is $m->{state}; only a queued move can be cancelled (a started one: move --rollback, a finished one: unmove).") unless $m->{state} eq 'queued';
+    my $d = mdir($a{cancel}); unlink glob("$d/*"); rmdir $d; say "Cancelled move $a{cancel}."; return }
+  my @ids = dirs_in($O{moves}); unless (@ids) { say 'No moves queued.'; return }
+  say 'Moves:';
+  for my $id (@ids) { my $m = mget($id);
+    my $when = defined $m->{at} ? "at $m->{at}" : $m->{when_tight} ? 'when its drive is tight' : 'when run';
+    say "  $id: seat $m->{seat}, $m->{from} -> $m->{to}, $when, " . ($m->{remove_source} ? 'removes source' : 'keeps source') . "; $m->{state}" . (defined $m->{note} ? " ($m->{note})" : '') . '.' } }
+
+sub file_list { my ($src, $whole) = @_; my (@f, @d, @skip);
+  File::Find::find({ no_chdir => 1, wanted => sub {
+    my $p = $File::Find::name; my $rel = $p eq $src ? '' : substr($p, length($src) + 1);
+    if (-d $p && !-l $p) { if (basename($p) eq '.git' && !($whole && $rel eq '.git')) { push @skip, $rel; $File::Find::prune = 1; return }
+      push @d, $rel if length $rel; return }
+    return if $p =~ /\.healer-part$/;
+    if (-f $p && !-l $p) { push @f, $rel } else { push @skip, $rel } } }, $src);
+  return ([sort @f], [sort @d], [sort @skip]) }
+
+sub sha { my $f = shift; my $s = Digest::SHA->new(256); $s->addfile($f, 'b'); $s->hexdigest }
+
+sub dest_avail_kb { my $to = shift; my $dr = drive_of_path($to);
+  for my $d (read_df()) { return $d->{avail} if length $dr && $d->{d} eq $dr }
+  return undef if defined $O{df};
+  my $p = mapped($to); $p = dirname($p) until -e $p || $p eq '/' || $p eq '.';
+  my @l = `df -P "$p" 2>/dev/null`; my @f = split ' ', ($l[1] // ''); return @f >= 6 ? $f[-3] : undef }
+
+sub run_move { my ($id, $rs_flag) = @_; my $m = mget($id) // refuse("no move $id.");
+  refuse("move $id is $m->{state}.") if $m->{state} =~ /^(?:done|unmoved)$/;
+  my $d = mdir($id); put("$d/remove_source", 'yes') if $rs_flag; $m->{remove_source} = 'yes' if $rs_flag;
+  my ($src, $dst) = (mapped($m->{from}), mapped($m->{to}));
+  return fail_move($id, "source $src is not there") unless -d $src;
+  my $whole = -d "$src/.git";
+  my ($files, $dirs, $skip) = file_list($src, $whole);
+  if ($m->{state} eq 'queued' && -d $dst) { opendir(my $h, $dst); my @in = grep { !/^\.\.?$/ } readdir $h; closedir $h;
+    return fail_move($id, "destination $dst is not empty") if @in }
+  my $bytes = 0; $bytes += -s "$src/$_" for @$files;
+  my $done = 0; for (@$files) { $done += -s "$src/$_" if -f "$dst/$_" && -s "$dst/$_" == -s "$src/$_" }
+  my $need = $bytes - $done + ($m->{margin_mb} // 1024) * 1048576;
+  my $av = dest_avail_kb($m->{to});
+  return fail_move($id, 'cannot tell the free space at the destination', 1) unless defined $av || $bytes == $done;
+  return fail_move($id, sprintf('the destination has %s free and the move needs %s (with its margin)', human($av), human(int($need / 1024))), 1) if $bytes > $done && $av * 1024 < $need;  # PR:space-check
+  say "  Move $id: copying " . scalar(@$files) . ' files (' . human(int($bytes / 1024)) . ") from $src to $dst" . ($whole ? ' (the whole git work tree, .git included)' : '') . '.';
+  put("$d/state", 'copying');
+  # 1. hash the source: the manifest
+  my %h; open(my $mf, '>', "$d/manifest.part") or die2("cannot write manifest"); for (@$files) { $h{$_} = sha("$src/$_"); print $mf "$h{$_}  $_\n" } close $mf;
+  rename "$d/manifest.part", "$d/manifest"; open(my $df, '>', "$d/dirs"); print $df "$_\n" for @$dirs; close $df;
+  # 2. copy: each file to NAME.healer-part, then renamed; a file already there and whole is kept (resume)
+  make_path($dst, map { "$dst/$_" } @$dirs);
+  for (@$files) { my $t = "$dst/$_"; next if -f $t && -s $t == -s "$src/$_" && sha($t) eq $h{$_};
+    copy("$src/$_", "$t.healer-part") or return rollback($id, $files, "copy of $_ failed: $!");
+    my @st = stat("$src/$_"); utime $st[8], $st[9], "$t.healer-part"; rename "$t.healer-part", $t or return rollback($id, $files, "rename of $_ failed: $!") }
+  system('sh', '-c', $ENV{AVALON_HEALER_HOOK_AFTER_COPY}) if $ENV{AVALON_HEALER_HOOK_AFTER_COPY};   # tests only: harm the copy on purpose
+  ;  # PR:early-remove
+  # 3. verify every file on both sides against the manifest
+  my @bad = grep { !-f "$dst/$_" || sha("$dst/$_") ne $h{$_} || sha("$src/$_") ne $h{$_} } @$files;
+  return rollback($id, $files, scalar(@bad) . ' file(s) did not verify (first: ' . $bad[0] . ')') if @bad;  # PR:mismatch-refused
+  put("$d/state", 'copied'); put("$d/unmove", "from $m->{from} to $m->{to} files " . scalar(@$files) . ' verified ' . stamp());
+  unless ($m->{remove_source}) { put("$d/note", 'copied and verified; source kept, space not freed yet');
+    say "  Move $id: copied and verified; the source is kept, so no space is freed yet. To finish: perl avalon-healer move --run $id --remove-source"; return 0 }
+  remove_source_files($src, $files, $dirs);
+  forward($m); put("$d/state", 'done'); put("$d/finished", stamp()); unlink "$d/note";
+  say "  Move $id: done. Every file verified, the source removed" . (@$skip ? ' (left behind: ' . join(', ', @$skip) . ')' : '') . "; seat $m->{seat} now at $m->{to}. To reverse: perl avalon-healer unmove $id"; 0 }
+
+sub remove_source_files { my ($src, $files, $dirs) = @_;
+  unlink "$src/$_" for @$files; rmdir "$src/$_" for reverse sort @$dirs; rmdir $src }
+
+sub forward { my $m = shift; my $sd = "$O{seats}/$m->{seat}"; make_path($O{state});
+  put("$sd/moved_from", $m->{from}); put("$sd/path", $m->{to});
+  my $dr = drive_of_path($m->{to}); put("$sd/drive", $dr) if length $dr;
+  if (open(my $h, '>>', "$O{state}/forwarding")) { print $h join("\t", stamp(), $m->{seat}, $m->{from}, $m->{to}), "\n"; close $h } }
+
+sub fail_move { my ($id, $why, $stay) = @_; my $d = mdir($id);
+  put("$d/note", "refused: $why"); put("$d/state", 'failed') unless $stay;
+  say "  Move $id refused: $why. Nothing was copied or removed."; 1 }
+
+sub rollback { my ($id, $files, $why) = @_; my $m = mget($id); my $dst = mapped($m->{to}); my $d = mdir($id);
+  for (@$files) { unlink "$dst/$_.healer-part"; unlink "$dst/$_" }
+  my @dirs = lines_of("$d/dirs"); rmdir "$dst/$_" for reverse sort @dirs; rmdir $dst;
+  put("$d/state", 'rolledback'); put("$d/note", "rolled back: $why");
+  say "  Move $id rolled back: $why. The copy was removed; the source is untouched."; 1 }
+
+sub rollback_cmd { my $id = shift; my $m = mget($id) // refuse("no move $id.");
+  refuse("move $id is $m->{state}; rollback is for a move that did not finish (use unmove for a finished one).") unless $m->{state} =~ /^(?:copying|copied|failed)$/;
+  my @files = map { (split /  /, $_, 2)[1] } lines_of(mdir($id) . '/manifest'); rollback($id, \@files, 'asked for') }
+
+sub cmd_unmove { my $id = shift // refuse('unmove wants an ID'); my $m = mget($id) // refuse("no move $id.");
+  my ($src, $dst) = (mapped($m->{from}), mapped($m->{to})); my $d = mdir($id);
+  my %h = map { my ($s, $f) = split /  /, $_, 2; ($f => $s) } lines_of("$d/manifest"); my @files = sort keys %h; my @dirs = lines_of("$d/dirs");
+  if ($m->{state} eq 'copied') {
+    my @bad = grep { !-f "$src/$_" || sha("$src/$_") ne $h{$_} } @files;
+    refuse("the source no longer matches what was copied (" . scalar(@bad) . " file(s)); the copy at $dst is kept.") if @bad;
+    rollback($id, \@files, 'unmoved'); put("$d/state", 'unmoved'); say "Unmoved $id: the copy is gone, the source was never removed."; return }
+  refuse("move $id is $m->{state}; only a copied or done move can be unmoved.") unless $m->{state} eq 'done';
+  make_path($src, map { "$src/$_" } @dirs);
+  for (@files) { copy("$dst/$_", "$src/$_.healer-part") or refuse("copy back of $_ failed: $!"); rename "$src/$_.healer-part", "$src/$_" }
+  my @bad = grep { sha("$src/$_") ne $h{$_} } @files;
+  refuse(scalar(@bad) . " file(s) did not verify on the way back; both copies are kept for you to look at.") if @bad;
+  remove_source_files($dst, \@files, \@dirs);
+  my $sd = "$O{seats}/$m->{seat}"; put("$sd/path", $m->{from}); unlink "$sd/moved_from";
+  my $dr = drive_of_path($m->{from}); put("$sd/drive", $dr) if length $dr;
+  put("$d/state", 'unmoved'); say "Unmoved $id: " . scalar(@files) . " files back at $m->{from}, verified; the moved copy removed; seat $m->{seat} points home again." }
+
+sub run_due_moves { my $now = now_epoch(); my %tight = map { $_->{d} => 1 } grep { $_->{pct} >= $O{tight} } read_df();
+  for my $id (dirs_in($O{moves})) { my $m = mget($id);
+    if ($m->{state} eq 'copying') { say "  Move $id was interrupted; resuming."; run_move($id); next }
+    next unless $m->{state} eq 'queued';
+    my $due = defined $m->{at} ? (parse_stamp($m->{at}) // 9e9) <= $now
+            : $m->{when_tight} ? $tight{ drive_of_path($m->{from}) || fact("$O{seats}/$m->{seat}", 'drive') || '' } : 0;
+    run_move($id) if $due } }
+
+# ================================================================================ watch / stop / status
+sub cmd_watch { my %a = @_;
+  my $every = every_secs($a{every} // '17m') // refuse("--every wants a number and s, m, h, d or w");
+  make_path($O{state}); my $lock = "$O{state}/watch.lock";
+  unless (mkdir $lock) {
+    if (watch_live()) { refuse('watch is already running (pid ' . (line1("$O{state}/watch.pid") // '?') . ', heartbeat ' . (line1("$O{state}/heartbeat") // 'none') . '); stop it first: perl avalon-healer stop') }  # PR:one-watcher
+    say 'An old watch lock was left behind (no live pid, no fresh heartbeat); taking it over.' }
+  put("$O{state}/watch.pid", $$); unlink "$O{state}/watch.stop";
+  my $stop = 0; local $SIG{INT} = sub { $stop = 1 }; local $SIG{TERM} = sub { $stop = 1 };
+  $IN_WATCH = 1; my $pass = 0; my $passes = $a{once} ? 1 : $a{passes};
+  say "avalon-healer watch: pid $$, a pass every $every s. Stop with Ctrl-C or: perl avalon-healer stop";
+  while (!$stop) {
+    $pass++; put("$O{state}/heartbeat", stamp(time) . " ${every}s pass $pass pid $$");
+    say ''; say '== pass ', $pass, ' at ', stamp(), ' ==';
+    eval { cmd_look(); cmd_log(); say ''; jobs_report(); run_due_jobs() or failing_lines(); run_due_moves(); 1 } or say "  This pass stopped on an error: $@";
+    last if $passes && $pass >= $passes;
+    # between passes, adopted jobs keep their own cadence (a 1-minute job runs every minute, not every pass)
+    for my $sec (1 .. $every) { last if $stop || -e "$O{state}/watch.stop"; sleep 1;
+      if ($sec % 5 == 0) { eval { run_due_jobs(); 1 } or say "  Running adopted jobs stopped on an error: $@" } }  # PR:between-passes
+    last if -e "$O{state}/watch.stop";
+  }
+  unlink "$O{state}/watch.pid", "$O{state}/watch.stop"; rmdir $lock;
+  put("$O{state}/heartbeat", stamp(time) . " ${every}s stopped after pass $pass");
+  say "avalon-healer watch stopped after $pass pass(es)." }
+
+sub cmd_stop { my $pid = line1("$O{state}/watch.pid");
+  unless (-d "$O{state}/watch.lock") { say 'watch is not running.'; return }
+  put("$O{state}/watch.stop", stamp()); kill('TERM', $pid) if $pid && $pid =~ /^\d+$/;
+  for (1 .. 15) { last unless -d "$O{state}/watch.lock"; sleep 1 }
+  say -d "$O{state}/watch.lock" ? 'Asked watch to stop; it will stop after its current step.' : 'watch stopped.' }
+
+sub cmd_status { say watch_live() ? 'watch is running (pid ' . (line1("$O{state}/watch.pid") // '?') . '); last heartbeat: ' . (line1("$O{state}/heartbeat") // 'none') . '.'
+                                  : 'watch is not running' . (defined line1("$O{state}/heartbeat") ? '; last heartbeat: ' . line1("$O{state}/heartbeat") : '') . '.' }
+
+# ================================================================================ main
+my @COMMON = ('seats=s', 'state=s', 'jobs=s', 'moves=s', 'rules=s', 'df=s', 'du=s', 'map=s@', 'now=s', 'today=s', 'tight=i', 'cap=i', 'shown=i', 'schtasks=s', 'no-measure', 'raw', 'help');
+my %SPEC = (
+  look => ['trend'], advise => [], log => [],
+  seats => ['set=s', 'path=s', 'drive=s', 'role=s', 'home=s', 'home-path=s', 'ignored=s', 'note=s', 'fact=s@', 'unset=s@'],
+  jobs => ['set=s', 'task=s', 'source=s', 'every=s', 'log-glob=s', 'lock=s', 'ok-marker=s', 'note=s', 'unset=s@', 'scan', 'all', 'mine-rule=s', 'match=s', 'adopt=s', 'release=s'],
+  move => ['seat=s', 'to=s', 'at=s', 'when-tight', 'remove-source', 'margin-mb=i', 'run=s', 'rollback=s'],
+  moves => ['cancel=s'], unmove => [], watch => ['every=s', 'once', 'passes=i'], stop => [], status => [],
+);
+my $cmd = shift(@ARGV) // 'help';
+if ($cmd =~ /^(?:help|-h|--help)$/ || !$SPEC{$cmd}) {
+  print STDERR "avalon-healer: unknown command '$cmd'\n" unless $cmd =~ /^(?:help|-h|--help)$/;
+  print "usage: avalon-healer COMMAND [options]   (avalon-healer COMMAND --help for one)\n";
+  print "  $HELP{$_}\n" for qw(look advise log seats jobs move moves unmove watch stop status);
+  print "common options: --tight N (85)  --cap S (20)  --no-measure  --seats/--state/--jobs/--moves/--rules DIR  --df FILE  --map FROM=TO  --now YYYY-MM-DDTHH:MM\n";
+  exit($cmd =~ /^(?:help|-h|--help)$/ ? 0 : 2);
+}
+my %a;
+GetOptionsFromArray(\@ARGV, \%a, @COMMON, @{ $SPEC{$cmd} }) or do { print STDERR "usage: avalon-healer $HELP{$cmd}\n"; exit 2 };
+if ($a{help}) { print "usage: avalon-healer $HELP{$cmd}\n"; exit 0 }
+for (qw(seats state jobs moves rules df du now today tight cap shown schtasks raw no-measure)) { $O{$_} = $a{$_} if defined $a{$_} }
+push @{ $O{map} }, @{ $a{map} } if $a{map};
+my $rc = $cmd eq 'look' ? cmd_look(%a) : $cmd eq 'advise' ? cmd_advise() : $cmd eq 'log' ? cmd_log() : $cmd eq 'seats' ? cmd_seats(%a)
+       : $cmd eq 'jobs' ? cmd_jobs(%a) : $cmd eq 'move' ? cmd_move(%a) : $cmd eq 'moves' ? cmd_moves(%a) : $cmd eq 'unmove' ? cmd_unmove($ARGV[0])
+       : $cmd eq 'watch' ? cmd_watch(%a) : $cmd eq 'stop' ? cmd_stop() : cmd_status();
+exit(($cmd eq 'move' && defined $a{run} && $rc) ? 1 : 0);
